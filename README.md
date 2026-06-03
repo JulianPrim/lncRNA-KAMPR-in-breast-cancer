@@ -22,4 +22,4 @@ The analyses include:
 
 * TCGA/AMOCATI-based analyses linking **KAMPR/LINC00885** expression with **HLA genes, CTL score, immune-cold tumor phenotypes, and patient survival**.
 
-Overall, this repository provides the code used to reproduce the main transcriptomic, single-cell, immune-score, and survival analyses supporting the study.
+This repository provides the code used to reproduce the main transcriptomic, single-cell, immune-score, and survival analyses supporting the study.
