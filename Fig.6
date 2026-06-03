@@ -1,0 +1,1516 @@
+
+# ------------------------------------------------------------
+# Analysis of Wu et al. breast tumor scRNA-seq atlas
+# ------------------------------------------------------------
+# 29/05/2026
+# Julian Primig
+# This script generates Fig. 6A, 6C and 6D.
+#
+# It compares KAMPR/LINC00885-positive and -negative ER+ cancer epithelial
+# cells, generating half-violin plots for steroid signaling, endocrine
+# resistance and luminal differentiation genes.
+#
+# It also analyzes treated T-47D and ZR-75-1 cells from Ors et al. https://doi.org/10.1093/nar/gkac908, producing
+# UMAPs, KAMPR-positive cell fraction plots over time, and a heatmap of KAMPR
+# expression changes relative to untreated control cells.
+# ------------------------------------------------------------
+
+# ============================================================
+# Half-violin plot with:
+# - KAMPR+ on the left / KAMPR- on the right for each gene
+# Fig6A is Based on KAMPR / LINC00885 analysis in ER+ Cancer Epithelial Cells differential expression analysis
+# Generation of half violin plots for steroid and endocrine identity genes 
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(tibble)
+  library(gghalves)
+  library(patchwork)
+  library(grid)
+})
+
+# ------------------------------------------------------------
+# 0) Parameters
+# ------------------------------------------------------------
+
+seurat_file <- "seurat_obj.rds"
+
+gene_lnc   <- "LINC00885"
+gene_label <- "KAMPR"
+
+gene_annotation <- tibble::tribble(
+  ~Gene,      ~Pathway,
+  "ESR1",     "Canonical ER signaling",
+  "AR",       "Steroid / apocrine response",
+  "PGRMC1",   "Steroid / apocrine response",
+  "PIP",      "Steroid / apocrine response",
+  "APOD",     "Steroid / apocrine response",
+  "HOXB13",   "Endocrine resistance-associated",
+  "BCAR4",    "Endocrine resistance-associated",
+  "LMTK3","Endocrine resistance-associated",
+  "TFF3",     "Endocrine resistance-associated",
+  "SCGB2A2",  "Luminal secretory differentiation",
+  "SCGB2A1",  "Luminal secretory differentiation",
+  "SCGB1D2",  "Luminal secretory differentiation"
+)
+
+pathway_order <- c(
+  "Canonical ER signaling",
+  "Steroid / apocrine response",
+  "Endocrine resistance-associated",
+  "Luminal secretory differentiation"
+)
+
+cols_kampr <- c(
+  "KAMPR+" = "#7FA06A",
+  "KAMPR-" = "#A77EAA"
+)
+
+pathway_cols <- c(
+  "Canonical ER signaling"            = "#5B7FA3",
+  "Steroid / apocrine response"       = "#C97C6D",
+  "Endocrine resistance-associated"   = "#9B7AA5",
+  "Luminal secretory differentiation" = "#7FA6A3"
+)
+
+outdir <- "KAMPR_half_violin_modules_independent_scales"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+# ------------------------------------------------------------
+# 1) Load Seurat object
+# ------------------------------------------------------------
+
+seurat_obj <- readRDS(seurat_file)
+
+if (!inherits(seurat_obj, "Seurat")) {
+  stop("The loaded object is not a Seurat object.")
+}
+
+DefaultAssay(seurat_obj) <- "RNA"
+
+message("Loaded object: ", seurat_file)
+message("Cells: ", ncol(seurat_obj))
+message("Features: ", nrow(seurat_obj))
+
+# ------------------------------------------------------------
+# 2) Check metadata and genes
+# ------------------------------------------------------------
+
+if (!all(c("subtype", "celltype_major") %in% colnames(seurat_obj@meta.data))) {
+  stop("Metadata columns 'subtype' and/or 'celltype_major' are missing.")
+}
+
+if (!(gene_lnc %in% rownames(seurat_obj))) {
+  stop(
+    gene_lnc, " not found in object. Try:\n",
+    "grep('LINC00885|KAMPR|00885', rownames(seurat_obj), value = TRUE)"
+  )
+}
+
+genes_present <- gene_annotation$Gene[gene_annotation$Gene %in% rownames(seurat_obj)]
+genes_missing <- setdiff(gene_annotation$Gene, genes_present)
+
+if (length(genes_missing) > 0) {
+  warning("Missing genes skipped: ", paste(genes_missing, collapse = ", "))
+}
+
+if (length(genes_present) == 0) {
+  stop("None of the requested genes were found in the object.")
+}
+
+gene_annotation <- gene_annotation %>%
+  filter(Gene %in% genes_present) %>%
+  mutate(
+    Pathway = factor(Pathway, levels = pathway_order)
+  )
+
+message("Genes used: ", paste(gene_annotation$Gene, collapse = ", "))
+
+# ------------------------------------------------------------
+# 3) Subset ER+ Cancer Epithelial cells
+# ------------------------------------------------------------
+
+er_epi_obj <- subset(
+  seurat_obj,
+  subset = subtype == "ER+" & celltype_major == "Cancer Epithelial"
+)
+
+DefaultAssay(er_epi_obj) <- "RNA"
+
+message("ER+ Cancer Epithelial cells: ", ncol(er_epi_obj))
+
+if (ncol(er_epi_obj) == 0) {
+  stop("No ER+ Cancer Epithelial cells found with subtype == 'ER+' & celltype_major == 'Cancer Epithelial'.")
+}
+
+er_epi_obj <- NormalizeData(er_epi_obj, verbose = FALSE)
+
+# ------------------------------------------------------------
+# 4) Define KAMPR+ and KAMPR- cells
+# ------------------------------------------------------------
+
+lnc_expr <- FetchData(er_epi_obj, vars = gene_lnc)[, 1]
+
+er_epi_obj$KAMPR_status <- ifelse(lnc_expr > 0, "KAMPR+", "KAMPR-")
+er_epi_obj$KAMPR_status <- factor(er_epi_obj$KAMPR_status, levels = c("KAMPR+", "KAMPR-"))
+
+message("KAMPR groups:")
+print(table(er_epi_obj$KAMPR_status))
+
+# ------------------------------------------------------------
+# 5) Fetch expression data
+# ------------------------------------------------------------
+
+plot_df <- FetchData(
+  object = er_epi_obj,
+  vars = c(gene_annotation$Gene, "KAMPR_status")
+) %>%
+  rownames_to_column("Cell") %>%
+  pivot_longer(
+    cols = all_of(gene_annotation$Gene),
+    names_to = "Gene",
+    values_to = "Expression"
+  ) %>%
+  left_join(gene_annotation, by = "Gene") %>%
+  mutate(
+    Pathway      = factor(Pathway, levels = pathway_order),
+    KAMPR_status = factor(KAMPR_status, levels = c("KAMPR+", "KAMPR-"))
+  )
+
+# ------------------------------------------------------------
+# 6) Statistics
+# ------------------------------------------------------------
+
+stat_df <- plot_df %>%
+  group_by(Pathway, Gene) %>%
+  summarise(
+    p_value = tryCatch(
+      wilcox.test(Expression ~ KAMPR_status)$p.value,
+      error = function(e) NA_real_
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_adj = p.adjust(p_value, method = "BH"),
+    stars = case_when(
+      is.na(p_adj) ~ "ns",
+      p_adj < 1e-4 ~ "****",
+      p_adj < 1e-3 ~ "***",
+      p_adj < 1e-2 ~ "**",
+      p_adj < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+  )
+
+write.csv(
+  stat_df,
+  file = file.path(outdir, "KAMPR_half_violin_stats.csv"),
+  row.names = FALSE
+)
+
+# ------------------------------------------------------------
+# 7) Helper: make one module block
+# ------------------------------------------------------------
+
+make_module_block <- function(module_name, show_y = FALSE) {
+  
+  # ------------------------
+  # Data for this module
+  # ------------------------
+  mod_genes <- gene_annotation %>%
+    filter(Pathway == module_name) %>%
+    pull(Gene)
+  
+  mod_df <- plot_df %>%
+    filter(Pathway == module_name, Gene %in% mod_genes) %>%
+    mutate(
+      Gene = factor(Gene, levels = mod_genes),
+      x = as.numeric(factor(Gene, levels = mod_genes)),
+      group_id = interaction(Gene, KAMPR_status, drop = TRUE)
+    )
+  
+  mod_stats <- stat_df %>%
+    filter(Pathway == module_name, Gene %in% mod_genes) %>%
+    mutate(
+      Gene = factor(Gene, levels = mod_genes),
+      x = as.numeric(factor(Gene, levels = mod_genes))
+    )
+  
+  # ------------------------
+  # Medians = colored points
+  # ------------------------
+  med_df <- mod_df %>%
+    group_by(Gene, x, KAMPR_status) %>%
+    summarise(
+      med = median(Expression, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      x_point = ifelse(KAMPR_status == "KAMPR+", x - 0.12, x + 0.12)
+    )
+  
+  # ------------------------
+  # Star positions per gene
+  # ------------------------
+  gene_max_df <- mod_df %>%
+    group_by(Gene, x) %>%
+    summarise(
+      ymax_gene = max(Expression, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  mod_range <- range(mod_df$Expression, na.rm = TRUE)
+  mod_span  <- max(mod_range[2] - mod_range[1], 0.5)
+  
+  mod_stats_plot <- mod_stats %>%
+    left_join(gene_max_df, by = c("Gene", "x")) %>%
+    mutate(
+      star_y  = ymax_gene + 0.10 * mod_span,
+      blank_y = ymax_gene + 0.20 * mod_span
+    )
+  
+  # ------------------------
+  # Main plot
+  # ------------------------
+  p_main <- ggplot() +
+    geom_blank(
+      data = mod_stats_plot,
+      aes(x = x, y = blank_y)
+    ) +
+    gghalves::geom_half_violin(
+      data = mod_df %>% filter(KAMPR_status == "KAMPR+"),
+      aes(
+        x = x,
+        y = Expression,
+        fill = KAMPR_status,
+        group = group_id
+      ),
+      side = "l",
+      trim = TRUE,
+      scale = "width",
+      width = 0.84,
+      alpha = 0.95,
+      color = "#2F2F2F",
+      linewidth = 0.30,
+      show.legend = TRUE
+    ) +
+    gghalves::geom_half_violin(
+      data = mod_df %>% filter(KAMPR_status == "KAMPR-"),
+      aes(
+        x = x,
+        y = Expression,
+        fill = KAMPR_status,
+        group = group_id
+      ),
+      side = "r",
+      trim = TRUE,
+      scale = "width",
+      width = 0.84,
+      alpha = 0.95,
+      color = "#2F2F2F",
+      linewidth = 0.30,
+      show.legend = TRUE
+    ) +
+    geom_point(
+      data = med_df,
+      aes(x = x_point, y = med, fill = KAMPR_status),
+      shape = 21,
+      size = 1.8,
+      stroke = 0.22,
+      color = "black",
+      inherit.aes = FALSE,
+      show.legend = FALSE
+    ) +
+    geom_text(
+      data = mod_stats_plot,
+      aes(x = x, y = star_y, label = stars),
+      size = 2.6,
+      fontface = "bold",
+      vjust = 0,
+      color = "black",
+      inherit.aes = FALSE
+    ) +
+    scale_fill_manual(
+      values = cols_kampr,
+      breaks = c("KAMPR+", "KAMPR-"),
+      drop = FALSE,
+      name = NULL
+    ) +
+    scale_x_continuous(
+      breaks = seq_along(mod_genes),
+      labels = mod_genes,
+      expand = expansion(add = c(0.45, 0.45))
+    ) +
+    labs(
+      x = NULL,
+      y = if (show_y) "norm LogUMI/cell" else NULL,
+      title = NULL
+    ) +
+    theme_classic(base_size = 8) +
+    theme(
+      plot.background  = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA),
+      panel.grid = element_blank(),
+      plot.title = element_blank(),
+      
+      axis.text.x  = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.line.x  = element_blank(),
+      
+      axis.text.y = if (show_y) {
+        element_text(size = 7, color = "black")
+      } else {
+        element_blank()
+      },
+      axis.ticks.y = if (show_y) {
+        element_line(color = "black")
+      } else {
+        element_blank()
+      },
+      axis.line.y = if (show_y) {
+        element_line(color = "black")
+      } else {
+        element_blank()
+      },
+      axis.title.y = if (show_y) {
+        element_text(size = 9, color = "black", margin = margin(r = 8))
+      } else {
+        element_blank()
+      },
+      
+      legend.position = "bottom",
+      legend.text = element_text(size = 7.5),
+      legend.key.height = unit(0.24, "cm"),
+      legend.key.width  = unit(0.45, "cm"),
+      legend.spacing.x  = unit(0.12, "cm"),
+      legend.margin     = margin(0, 0, 0, 0),
+      
+      # reduced inter-module spacing
+      plot.margin = margin(4, 1, 0, 1)
+    ) +
+    guides(
+      fill = guide_legend(
+        nrow = 1,
+        byrow = TRUE,
+        override.aes = list(alpha = 1)
+      )
+    )
+  
+  # ------------------------
+  # Tile strip underneath
+  # ------------------------
+  n_genes <- length(mod_genes)
+  
+  p_tile <- ggplot() +
+    geom_rect(
+      aes(
+        xmin = 0.55,
+        xmax = n_genes + 0.45,
+        ymin = 0,
+        ymax = 1
+      ),
+      fill = pathway_cols[as.character(module_name)],
+      color = NA
+    ) +
+    scale_x_continuous(
+      breaks = seq_along(mod_genes),
+      labels = mod_genes,
+      expand = expansion(add = c(0.45, 0.45))
+    ) +
+    scale_y_continuous(
+      limits = c(0, 1),
+      breaks = NULL,
+      labels = NULL,
+      expand = c(0, 0)
+    ) +
+    labs(x = NULL, y = NULL) +
+    theme_classic(base_size = 8) +
+    theme(
+      plot.background  = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA),
+      
+      axis.line = element_blank(),
+      axis.ticks = element_blank(),
+      axis.text.y = element_blank(),
+      
+      axis.text.x = element_text(
+        angle = 45,
+        hjust = 1,
+        vjust = 1,
+        size = 8.5,
+        color = "black",
+        face = "italic"
+      ),
+      
+      # reduced inter-module spacing
+      plot.margin = margin(0, 1, 4, 1)
+    )
+  
+  p_main / p_tile +
+    plot_layout(heights = c(9.0, 0.35))
+}
+
+# ------------------------------------------------------------
+# 8) Build all module blocks
+# ------------------------------------------------------------
+
+module_levels_present <- gene_annotation %>%
+  distinct(Pathway) %>%
+  pull(Pathway) %>%
+  as.character()
+
+module_levels_present <- pathway_order[pathway_order %in% module_levels_present]
+
+module_sizes <- gene_annotation %>%
+  dplyr::count(Pathway, name = "n") %>%
+  dplyr::mutate(Pathway = as.character(Pathway)) %>%
+  dplyr::arrange(match(Pathway, module_levels_present)) %>%
+  dplyr::pull(n)
+
+plot_list <- vector("list", length(module_levels_present))
+
+for (i in seq_along(module_levels_present)) {
+  plot_list[[i]] <- make_module_block(
+    module_name = module_levels_present[i],
+    show_y = (i == 1)
+  )
+}
+
+final_plot <- wrap_plots(
+  plotlist = plot_list,
+  nrow = 1,
+  widths = module_sizes,
+  guides = "collect"
+) &
+  theme(
+    legend.position = "bottom",
+    legend.justification = "center",
+    legend.text = element_text(size = 7.5),
+    legend.key.height = unit(0.24, "cm"),
+    legend.key.width  = unit(0.45, "cm"),
+    legend.spacing.x  = unit(0.12, "cm"),
+    legend.margin     = margin(0, 0, 0, 0)
+  )
+
+print(final_plot)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+##############################################################################
+# This code generates a UMAP of treated T47D cells from Ors et al. NAR
+# And a spaghetti plot of KAMPR % positive cells
+##############################################################################
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(Matrix)
+  library(Seurat)
+  library(ggplot2)
+  library(patchwork)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(RColorBrewer)
+  library(tibble)
+})
+
+set.seed(1)
+
+# =========================
+# 0) Palette, labels, themes
+# =========================
+
+# Labels propres
+label_map <- c(
+  "E"   = "E2",
+  "T"   = "Tamoxifen",
+  "IC"  = "Fulvestrant",
+  "P"   = "Progesterone",
+  "D"   = "DHT",
+  "CTL" = "Control"
+)
+
+cond_order_full <- c(
+  "E2", "Tamoxifen", "Fulvestrant",
+  "Progesterone", "DHT", "Control"
+)
+
+# Palette douce, paper-like
+pal_named <- c(
+  "E2"           = "#5F7FA3",
+  "Tamoxifen"    = "#C97C7C",
+  "Fulvestrant"  = "#79AAA5",
+  "Progesterone" = "#A77EAA",
+  "DHT"          = "#7FA06A",
+  "Control"      = "#9E9E9E"
+)
+
+time_levels <- c("0h", "3h", "6h", "24h", "48h", "72h")
+
+theme_paper <- function(base_size = 12) {
+  theme_classic(base_size = base_size) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, size = base_size + 1),
+      plot.subtitle = element_text(hjust = 0.5, colour = "grey30"),
+      axis.title = element_text(face = "bold"),
+      axis.text = element_text(colour = "black"),
+      legend.position = "right",
+      legend.title = element_blank(),
+      legend.text = element_text(size = base_size - 1),
+      panel.border = element_blank(),
+      strip.background = element_blank(),
+      strip.text = element_text(face = "bold"),
+      plot.background = element_blank()
+    )
+}
+
+theme_umap_paper <- function(base_size = 12) {
+  theme_classic(base_size = base_size) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, size = base_size + 1),
+      plot.subtitle = element_text(hjust = 0.5, colour = "grey30"),
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      axis.line = element_blank(),
+      legend.position = "right",
+      legend.title = element_blank(),
+      legend.text = element_text(size = base_size - 1),
+      panel.border = element_blank(),
+      strip.background = element_blank(),
+      strip.text = element_text(face = "bold"),
+      plot.background = element_blank()
+    )
+}
+
+# =========================
+# 1) Helpers: lecture SANS entête
+# =========================
+read_counts_noheader <- function(path) {
+  dt <- fread(path, sep = "\t", header = FALSE, check.names = FALSE)
+  genes <- dt[[1]]
+  stopifnot(!anyDuplicated(genes))
+  mat <- as.matrix(dt[, -1, with = FALSE])
+  rownames(mat) <- genes
+  Matrix(mat, sparse = TRUE)
+}
+
+read_meta_noheader <- function(path) {
+  m <- fread(path, sep = "\t", header = FALSE, check.names = FALSE)
+  stopifnot(ncol(m) >= 3)
+  m <- as.data.frame(m[, 1:3])
+  names(m) <- c("idx", "barcode", "label")
+  m$barcode <- toupper(as.character(m$barcode))
+  m$label   <- as.character(m$label)
+  
+  lab <- toupper(m$label)
+  
+  time <- ifelse(grepl("CTL", lab), "0h",
+                 ifelse(grepl("-0?3$", lab), "3h",
+                        ifelse(grepl("-0?6$", lab), "6h",
+                               ifelse(grepl("-24$", lab), "24h",
+                                      ifelse(grepl("-48$", lab), "48h",
+                                             ifelse(grepl("-72$", lab), "72h", NA))))))
+  
+  m$Time <- factor(ifelse(is.na(time), "NA", time),
+                   levels = c("0h", "3h", "6h", "24h", "48h", "72h", "NA"))
+  
+  m <- m[!is.na(m$barcode) & m$barcode != "", ]
+  m <- m[!duplicated(m$barcode), ]
+  rownames(m) <- m$barcode
+  m
+}
+
+# =========================
+# 2) Parse treatment / time
+# =========================
+parse_treatment <- function(x) {
+  x <- toupper(as.character(x))
+  out <- ifelse(grepl("CTL", x),
+                "CTL",
+                sub("^[A-Z0-9]+-([A-Z]+)-.*$", "\\1", x))
+  out[!out %in% c("E", "T", "IC", "P", "D", "CTL", "EP", "ED")] <- NA_character_
+  out
+}
+
+parse_time <- function(x) {
+  x <- toupper(as.character(x))
+  out <- ifelse(grepl("CTL", x),
+                "0h",
+                ifelse(grepl("-([0-9]+)$", x),
+                       paste0(as.integer(sub("^.*-([0-9]+)$", "\\1", x)), "h"),
+                       NA_character_))
+  factor(out, levels = time_levels)
+}
+
+# =========================
+# 3) Construit un Seurat par lot
+# =========================
+make_seurat_from_pair <- function(counts_path, meta_path, sample_id) {
+  counts <- read_counts_noheader(counts_path)
+  meta   <- read_meta_noheader(meta_path)
+  
+  n_cells_counts <- ncol(counts)
+  n_cells_meta   <- nrow(meta)
+  
+  if (n_cells_counts != n_cells_meta) {
+    nmin <- min(n_cells_counts, n_cells_meta)
+    message(sprintf("[%s] counts=%d, meta=%d -> alignement sur %d",
+                    sample_id, n_cells_counts, n_cells_meta, nmin))
+    counts <- counts[, 1:nmin, drop = FALSE]
+    meta   <- meta[1:nmin, , drop = FALSE]
+  }
+  
+  colnames(counts) <- rownames(meta)
+  meta$Sample <- sample_id
+  
+  CreateSeuratObject(
+    counts = counts,
+    meta.data = meta,
+    project = paste0("T47D_", sample_id),
+    min.cells = 3,
+    min.features = 200
+  )
+}
+
+# =========================
+# 4) Lecture des 3 lots + fusion
+# =========================
+t47d1 <- make_seurat_from_pair(
+  "GSM4681761_T47D_1_counts.txt.gz",
+  "GSM4681761_T47D_1_metadata.txt.gz",
+  "T47D_1"
+)
+
+t47d2 <- make_seurat_from_pair(
+  "GSM4681761_T47D_2_counts.txt.gz",
+  "GSM4681761_T47D_2_metadata.txt.gz",
+  "T47D_2"
+)
+
+t47d3 <- make_seurat_from_pair(
+  "GSM4681761_T47D_3_counts.txt.gz",
+  "GSM4681761_T47D_3_metadata.txt.gz",
+  "T47D_3"
+)
+
+t47d <- merge(
+  t47d1,
+  y = list(t47d2, t47d3),
+  add.cell.ids = c("T47D1", "T47D2", "T47D3")
+)
+
+# Filtrer EP / ED
+t47d$Treatment <- parse_treatment(t47d$label)
+keep_cells <- !t47d$Treatment %in% c("EP", "ED") & !is.na(t47d$Treatment)
+t47d <- subset(t47d, cells = colnames(t47d)[keep_cells])
+
+# Recréer métadonnées propres
+t47d$Treatment <- parse_treatment(t47d$label)
+t47d$Time <- parse_time(t47d$label)
+t47d$Treatment_full <- factor(recode(t47d$Treatment, !!!label_map), levels = cond_order_full)
+
+# =========================
+# 5) UMAP paper-like
+# =========================
+t47d <- NormalizeData(t47d, verbose = FALSE)
+t47d <- FindVariableFeatures(t47d, nfeatures = 3000, selection.method = "vst", verbose = FALSE)
+t47d <- ScaleData(t47d, features = VariableFeatures(t47d), verbose = FALSE)
+t47d <- RunPCA(t47d, features = VariableFeatures(t47d), npcs = 40, verbose = FALSE)
+t47d <- RunUMAP(t47d, dims = 1:30, n.neighbors = 30, min.dist = 0.3, verbose = FALSE)
+t47d <- FindNeighbors(t47d, dims = 1:30, verbose = FALSE)
+t47d <- FindClusters(t47d, resolution = 0.5, verbose = FALSE)
+
+p_umap <- DimPlot(
+  t47d,
+  reduction = "umap",
+  group.by = "Treatment_full",
+  cols = pal_named,
+  pt.size = 0.25,
+  raster = FALSE,
+  shuffle = TRUE
+) +
+  labs(title = "T-47D") +
+  theme_umap_paper(base_size = 12) +
+  guides(
+    colour = guide_legend(
+      override.aes = list(size = 4, alpha = 1)
+    )
+  )
+
+print(p_umap)
+
+# =========================
+# 6) Analyse d’un gène : LINC00885
+# =========================
+gene <- "LINC00885"
+stopifnot(gene %in% rownames(t47d))
+
+df <- FetchData(t47d, vars = c(gene, "label")) %>%
+  tibble::rownames_to_column("cell")
+
+names(df)[2] <- "expr"
+
+df$Treatment <- parse_treatment(df$label)
+df$Time <- parse_time(df$label)
+
+df <- df %>%
+  filter(!is.na(Treatment), !Treatment %in% c("EP", "ED"), !is.na(Time)) %>%
+  mutate(
+    Treatment_full = factor(recode(Treatment, !!!label_map), levels = cond_order_full)
+  )
+
+# Résumés
+summ <- df %>%
+  group_by(Treatment, Time, Treatment_full) %>%
+  summarise(
+    n = n(),
+    pct_pos  = mean(expr > 0, na.rm = TRUE),
+    mean_pos = if (sum(expr > 0, na.rm = TRUE) > 0) mean(expr[expr > 0], na.rm = TRUE) else NA_real_,
+    .groups = "drop"
+  )
+
+# Baseline contrôle
+ctl_vec <- df$expr[df$Treatment == "CTL"]
+ctl_pct <- mean(ctl_vec > 0, na.rm = TRUE)
+
+# Tests Wilcoxon vs contrôle
+p_tab <- df %>%
+  filter(Treatment != "CTL") %>%
+  group_by(Treatment, Time) %>%
+  summarise(
+    p = {
+      y <- expr
+      if (length(ctl_vec) > 2 && length(y) > 2) {
+        wilcox.test(ctl_vec, y)$p.value
+      } else {
+        NA_real_
+      }
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_adj = p.adjust(p, method = "fdr"),
+    star = case_when(
+      is.na(p_adj)     ~ "",
+      p_adj < 0.001    ~ "***",
+      p_adj < 0.01     ~ "**",
+      p_adj < 0.05     ~ "*",
+      TRUE             ~ ""
+    ),
+    Treatment_full = factor(recode(Treatment, !!!label_map), levels = cond_order_full)
+  )
+
+# =========================
+# 7) Spaghetti plot corrigé
+#    - Dexamethasone -> DHT
+#    - pas de bordures noires
+# =========================
+p_frac <- ggplot(
+  summ,
+  aes(x = Time, y = pct_pos, group = Treatment_full, color = Treatment_full)
+) +
+  geom_hline(
+    yintercept = ctl_pct,
+    linetype = "dashed",
+    color = "grey45",
+    linewidth = 0.5
+  ) +
+  geom_line(linewidth = 1, na.rm = TRUE) +
+  geom_point(size = 2.1, na.rm = TRUE) +
+  scale_color_manual(values = pal_named, drop = TRUE) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "KAMPR-positive cells",
+    x = NULL,
+    y = "% positive cells",
+    color = NULL
+  ) +
+  theme_paper(base_size = 12) +
+  theme(
+    panel.border = element_blank(),
+    plot.background = element_blank(),
+    legend.position = "right"
+  ) +
+  guides(
+    color = guide_legend(
+      override.aes = list(linewidth = 1.3, size = 3)
+    )
+  )
+
+print(p_frac)
+
+
+
+
+
+
+#########################################
+
+### This code generate a UMAP of treated ZR-75-1 cells
+### A spaghetti plot of KAMPR % positive cells during time
+### And a heatmap of KAMPR expression among positive cells in ZR-75-1 and T47D-cells
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(Matrix)
+  library(Seurat)
+  library(ggplot2)
+  library(patchwork)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(RColorBrewer)
+  library(stringr)
+  library(tibble)
+})
+
+set.seed(1)
+
+# =========================
+# 0) Palette, labels, themes
+# =========================
+
+label_map <- c(
+  "E"   = "E2",
+  "T"   = "Tamoxifen",
+  "IC"  = "Fulvestrant",
+  "P"   = "Progesterone",
+  "D"   = "DHT",
+  "CTL" = "Control"
+)
+
+cond_order_full <- c(
+  "E2", "Tamoxifen", "Fulvestrant",
+  "Progesterone", "DHT", "Control"
+)
+
+pal_named <- c(
+  "E2"           = "#5F7FA3",
+  "Tamoxifen"    = "#C97C7C",
+  "Fulvestrant"  = "#79AAA5",
+  "Progesterone" = "#A77EAA",
+  "DHT"          = "#7FA06A",
+  "Control"      = "#9E9E9E"
+)
+
+time_levels <- c("0h", "3h", "6h", "24h", "48h", "72h")
+
+theme_paper <- function(base_size = 12) {
+  theme_classic(base_size = base_size) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, size = base_size + 1),
+      plot.subtitle = element_text(hjust = 0.5, colour = "grey30"),
+      axis.title = element_text(face = "bold"),
+      axis.text = element_text(colour = "black"),
+      legend.position = "right",
+      legend.title = element_blank(),
+      legend.text = element_text(size = base_size - 1),
+      panel.border = element_blank(),
+      strip.background = element_blank(),
+      strip.text = element_text(face = "bold"),
+      plot.background = element_blank()
+    )
+}
+
+theme_umap_paper <- function(base_size = 12) {
+  theme_classic(base_size = base_size) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, size = base_size + 1),
+      plot.subtitle = element_text(hjust = 0.5, colour = "grey30"),
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      axis.line = element_blank(),
+      legend.position = "right",
+      legend.title = element_blank(),
+      legend.text = element_text(size = base_size - 1),
+      panel.border = element_blank(),
+      strip.background = element_blank(),
+      strip.text = element_text(face = "bold"),
+      plot.background = element_blank()
+    )
+}
+
+# =========================
+# 1) Helpers: lecture SANS entête
+# =========================
+
+read_counts_noheader <- function(path) {
+  dt <- fread(path, sep = "\t", header = FALSE, check.names = FALSE)
+  genes <- dt[[1]]
+  stopifnot(!anyDuplicated(genes))
+  
+  mat <- as.matrix(dt[, -1, with = FALSE])
+  rownames(mat) <- genes
+  
+  Matrix(mat, sparse = TRUE)
+}
+
+# =========================
+# 2) Parsing ZR-75-1
+# =========================
+
+parse_treatment_zr <- function(x) {
+  x <- toupper(as.character(x))
+  
+  out <- ifelse(
+    grepl("CTL", x),
+    "CTL",
+    sub("^ZR[-_]?([A-Z]+).*$", "\\1", x)
+  )
+  
+  out[!out %in% c("E", "T", "IC", "P", "D", "CTL", "EP", "ED")] <- NA_character_
+  out
+}
+
+parse_time_zr <- function(x) {
+  x <- tolower(as.character(x))
+  
+  is_ctl <- grepl("^zr[-_]?ctl\\b", x)
+  
+  tok <- str_match(x, "(0?3|0?6|24|48|49|72|04)\\b")[, 1]
+  tok[tok == "04"] <- "03"
+  tok[tok == "49"] <- "48"
+  
+  out <- ifelse(
+    is_ctl,
+    "0h",
+    case_when(
+      tok %in% c("3", "03") ~ "3h",
+      tok %in% c("6", "06") ~ "6h",
+      tok == "24"           ~ "24h",
+      tok == "48"           ~ "48h",
+      tok == "72"           ~ "72h",
+      TRUE                  ~ NA_character_
+    )
+  )
+  
+  factor(out, levels = time_levels)
+}
+
+read_meta_noheader_zr <- function(path) {
+  m <- fread(path, sep = "\t", header = FALSE, check.names = FALSE)
+  stopifnot(ncol(m) >= 3)
+  
+  m <- as.data.frame(m[, 1:3])
+  names(m) <- c("idx", "barcode", "label")
+  
+  m$barcode <- toupper(as.character(m$barcode))
+  m$label   <- as.character(m$label)
+  
+  m$Treatment <- parse_treatment_zr(m$label)
+  m$Time      <- parse_time_zr(m$label)
+  
+  m <- m[!is.na(m$barcode) & m$barcode != "", ]
+  m <- m[!duplicated(m$barcode), ]
+  rownames(m) <- m$barcode
+  
+  m
+}
+
+# =========================
+# 3) Construit un Seurat par lot
+# =========================
+
+make_seurat_from_pair <- function(counts_path, meta_path, sample_id) {
+  counts <- read_counts_noheader(counts_path)
+  meta   <- read_meta_noheader_zr(meta_path)
+  
+  n_counts <- ncol(counts)
+  n_meta   <- nrow(meta)
+  
+  if (n_counts != n_meta) {
+    nmin <- min(n_counts, n_meta)
+    message(sprintf("[%s] counts=%d, meta=%d -> alignement sur %d",
+                    sample_id, n_counts, n_meta, nmin))
+    
+    counts <- counts[, 1:nmin, drop = FALSE]
+    meta   <- meta[1:nmin, , drop = FALSE]
+  }
+  
+  colnames(counts) <- rownames(meta)
+  meta$Sample <- sample_id
+  
+  CreateSeuratObject(
+    counts = counts,
+    meta.data = meta,
+    project = paste0("ZR_", sample_id),
+    min.cells = 3,
+    min.features = 200
+  )
+}
+
+# =========================
+# 4) Charger les 3 lots ZR + fusion
+# =========================
+
+zr1 <- make_seurat_from_pair(
+  "GSM4681762_ZR_1_counts.txt.gz",
+  "GSM4681762_ZR_1_metadata.txt.gz",
+  "ZR_1"
+)
+
+zr2 <- make_seurat_from_pair(
+  "GSM4681762_ZR_2_counts.txt.gz",
+  "GSM4681762_ZR_2_metadata.txt.gz",
+  "ZR_2"
+)
+
+zr3 <- make_seurat_from_pair(
+  "GSM4681762_ZR_3_counts.txt.gz",
+  "GSM4681762_ZR_3_metadata.txt.gz",
+  "ZR_3"
+)
+
+zr <- merge(
+  zr1,
+  y = list(zr2, zr3),
+  add.cell.ids = c("ZR1", "ZR2", "ZR3")
+)
+
+# =========================
+# 5) Métadonnées propres + exclusion EP / ED
+# =========================
+
+zr$Treatment <- parse_treatment_zr(zr$label)
+zr$Time      <- parse_time_zr(zr$label)
+
+keep_cells <- !zr$Treatment %in% c("EP", "ED") & !is.na(zr$Treatment) & !is.na(zr$Time)
+zr <- subset(zr, cells = colnames(zr)[keep_cells])
+
+zr$Treatment <- parse_treatment_zr(zr$label)
+zr$Time      <- parse_time_zr(zr$label)
+
+zr$Treatment_full <- factor(
+  recode(zr$Treatment, !!!label_map),
+  levels = cond_order_full
+)
+
+# =========================
+# 6) UMAP paper-like
+# =========================
+
+zr <- NormalizeData(zr, verbose = FALSE)
+zr <- FindVariableFeatures(zr, nfeatures = 3000, selection.method = "vst", verbose = FALSE)
+zr <- ScaleData(zr, features = VariableFeatures(zr), verbose = FALSE)
+zr <- RunPCA(zr, features = VariableFeatures(zr), npcs = 40, verbose = FALSE)
+zr <- RunUMAP(zr, dims = 1:30, n.neighbors = 30, min.dist = 0.3, verbose = FALSE)
+zr <- FindNeighbors(zr, dims = 1:30, verbose = FALSE)
+zr <- FindClusters(zr, resolution = 0.5, verbose = FALSE)
+
+p_umap <- DimPlot(
+  zr,
+  reduction = "umap",
+  group.by = "Treatment_full",
+  cols = pal_named,
+  pt.size = 0.25,
+  raster = FALSE,
+  shuffle = TRUE
+) +
+  labs(title = "ZR-75-1") +
+  theme_umap_paper(base_size = 12) +
+  guides(
+    colour = guide_legend(
+      override.aes = list(size = 4, alpha = 1)
+    )
+  )
+
+print(p_umap)
+
+
+# =========================
+# 7) Analyse d’un gène : LINC00885
+# =========================
+
+gene <- "LINC00885"
+stopifnot(gene %in% rownames(zr))
+
+df <- FetchData(zr, vars = c(gene, "label")) %>%
+  tibble::rownames_to_column("cell")
+
+names(df)[2] <- "expr"
+
+df$Treatment <- parse_treatment_zr(df$label)
+df$Time      <- parse_time_zr(df$label)
+
+df <- df %>%
+  filter(
+    !is.na(Treatment),
+    !Treatment %in% c("EP", "ED"),
+    !is.na(Time)
+  ) %>%
+  mutate(
+    Treatment_full = factor(
+      recode(Treatment, !!!label_map),
+      levels = cond_order_full
+    )
+  )
+
+# Résumés
+summ <- df %>%
+  group_by(Treatment, Time, Treatment_full) %>%
+  summarise(
+    n        = n(),
+    pct_pos  = mean(expr > 0, na.rm = TRUE),
+    mean_pos = if (sum(expr > 0, na.rm = TRUE) > 0) {
+      mean(expr[expr > 0], na.rm = TRUE)
+    } else {
+      NA_real_
+    },
+    .groups = "drop"
+  )
+
+# Baseline Control
+ctl_vec <- df$expr[df$Treatment == "CTL"]
+ctl_pct <- mean(ctl_vec > 0, na.rm = TRUE)
+
+# Tests Wilcoxon vs Control
+p_tab <- df %>%
+  filter(Treatment != "CTL") %>%
+  group_by(Treatment, Time) %>%
+  summarise(
+    p = {
+      y <- expr
+      if (length(ctl_vec) > 2 && length(y) > 2) {
+        wilcox.test(ctl_vec, y)$p.value
+      } else {
+        NA_real_
+      }
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_adj = p.adjust(p, method = "fdr"),
+    star = case_when(
+      is.na(p_adj)  ~ "",
+      p_adj < 0.001 ~ "***",
+      p_adj < 0.01  ~ "**",
+      p_adj < 0.05  ~ "*",
+      TRUE          ~ ""
+    ),
+    Treatment_full = factor(
+      recode(Treatment, !!!label_map),
+      levels = cond_order_full
+    )
+  )
+
+# =========================
+# 8) Spaghetti plot paper-like
+# =========================
+
+p_frac <- ggplot(
+  summ,
+  aes(
+    x = Time,
+    y = pct_pos,
+    group = Treatment_full,
+    color = Treatment_full
+  )
+) +
+  geom_hline(
+    yintercept = ctl_pct,
+    linetype = "dashed",
+    color = "grey45",
+    linewidth = 0.5
+  ) +
+  geom_line(linewidth = 1, na.rm = TRUE) +
+  geom_point(size = 2.1, na.rm = TRUE) +
+  scale_color_manual(values = pal_named, drop = TRUE) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "KAMPR-positive cells",
+    x = NULL,
+    y = "% positive cells",
+    color = NULL
+  ) +
+  theme_paper(base_size = 12) +
+  theme(
+    panel.border = element_blank(),
+    plot.background = element_blank(),
+    legend.position = "right"
+  ) +
+  guides(
+    color = guide_legend(
+      override.aes = list(linewidth = 1.3, size = 3)
+    )
+  )
+
+print(p_frac)
+
+
+
+
+##############################
+# Heatmap of KAMPR expression
+# among KAMPR+ cells normalized as
+# log2FC versus untreated control
+##############################
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(patchwork)
+  library(scales)
+  library(grid)
+})
+
+# =========================================================
+# Settings
+# =========================================================
+
+# Keep only these time points
+time_levels_small <- c("0h", "3h", "48h")
+
+# Condition order
+cond_order_full <- c("E2", "Tamoxifen", "Fulvestrant", "Progesterone", "DHT", "Control")
+
+# More contrasted divergent color palette
+fc_cols <- c(
+  "#5F8A5A",   # strong negative
+  "#DCE8D6",   # weak negative
+  "beige",     # center
+  "#B7CAD7",   # weak positive
+  "#243B63"    # strong positive
+)
+
+# =========================================================
+# Functions
+# =========================================================
+
+make_complete_mat_small <- function(df) {
+  df %>%
+    mutate(
+      Treatment_full = factor(as.character(Treatment_full), levels = cond_order_full),
+      Time = factor(as.character(Time), levels = time_levels_small)
+    ) %>%
+    filter(Time %in% time_levels_small) %>%
+    complete(
+      Treatment_full = factor(cond_order_full, levels = cond_order_full),
+      Time = factor(time_levels_small, levels = time_levels_small)
+    )
+}
+
+add_log2fc_vs_control <- function(summ, value_col = "mean_pos", pseudocount = 1e-6) {
+  
+  ctl_val <- summ %>%
+    filter(as.character(Treatment_full) == "Control", as.character(Time) == "0h") %>%
+    pull(.data[[value_col]])
+  
+  if (length(ctl_val) != 1 || !is.finite(ctl_val)) {
+    stop("Unable to retrieve a unique value for Control 0h.")
+  }
+  
+  summ %>%
+    mutate(
+      log2FC_vs_ctl0 = log2((.data[[value_col]] + pseudocount) / (ctl_val + pseudocount))
+    )
+}
+
+plot_heatmap_fc_small <- function(
+    summ,
+    title = "KAMPR",
+    value_col = "mean_pos",
+    fc_name = "log2FC\nvs Control 0h",
+    shared_limit = NULL,
+    cross_on_na = TRUE
+) {
+  
+  # Keep only the selected time points
+  summ2 <- summ %>%
+    filter(as.character(Time) %in% time_levels_small)
+  
+  ctl_val <- summ2 %>%
+    filter(as.character(Treatment_full) == "Control", as.character(Time) == "0h") %>%
+    pull(.data[[value_col]])
+  
+  if (length(ctl_val) != 1 || !is.finite(ctl_val)) {
+    stop("Control 0h is missing or invalid.")
+  }
+  
+  mat <- add_log2fc_vs_control(summ2, value_col = value_col) %>%
+    make_complete_mat_small()
+  
+  mat <- mat %>%
+    mutate(
+      log2FC_vs_ctl0 = ifelse(
+        is.na(.data[[value_col]]),
+        NA_real_,
+        log2((.data[[value_col]] + 1e-6) / (ctl_val + 1e-6))
+      )
+    )
+  
+  # Shared limit / contrast
+  if (!is.null(shared_limit)) {
+    lim <- shared_limit
+  } else {
+    vals <- abs(mat$log2FC_vs_ctl0[is.finite(mat$log2FC_vs_ctl0)])
+    lim <- ifelse(length(vals) == 0, 1, max(0.25, unname(quantile(vals, 0.95, na.rm = TRUE))))
+  }
+  
+  if (!is.finite(lim) || lim <= 0) lim <- 1
+  
+  # Control 0h reference cell
+  ctl_cell <- mat %>%
+    filter(Treatment_full == "Control", Time == "0h")
+  
+  # Missing-value cells
+  na_cells <- mat %>%
+    filter(is.na(log2FC_vs_ctl0))
+  
+  p <- ggplot(mat, aes(x = Time, y = Treatment_full)) +
+    
+    # General background
+    geom_tile(
+      fill = "#FCFCFC",
+      color = "#F2F2F2",
+      linewidth = 0.95
+    ) +
+    
+    # Actual data tiles
+    geom_tile(
+      data = mat %>% filter(!is.na(log2FC_vs_ctl0)),
+      aes(fill = log2FC_vs_ctl0),
+      color = "white",
+      linewidth = 0.95
+    ) +
+    
+    # Discrete outline around the Control 0h reference cell
+    geom_tile(
+      data = ctl_cell,
+      fill = NA,
+      color = "lightgrey",
+      linewidth = 0.8
+    ) +
+    
+    scale_fill_gradientn(
+      colours = fc_cols,
+      values = scales::rescale(c(-lim, -0.20 * lim, 0, 0.20 * lim, lim)),
+      limits = c(-lim, lim),
+      oob = scales::squish,
+      na.value = "#FCFCFC",
+      name = fc_name
+    ) +
+    
+    labs(
+      title = title,
+      x = NULL,
+      y = NULL
+    ) +
+    
+    coord_fixed() +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 18),
+      axis.text.x = element_text(color = "black", size = 12),
+      axis.text.y = element_text(color = "black", size = 12),
+      axis.ticks = element_blank(),
+      axis.line = element_blank(),
+      panel.border = element_blank(),
+      panel.background = element_rect(fill = "white", colour = NA),
+      plot.background = element_rect(fill = "white", colour = NA),
+      legend.title = element_text(size = 11),
+      legend.text = element_text(size = 10),
+      legend.key.height = unit(0.55, "cm"),
+      legend.key.width = unit(0.38, "cm"),
+      plot.margin = margin(6, 10, 6, 6)
+    )
+  
+  # Add a subtle cross on missing-value cells
+  if (cross_on_na) {
+    p <- p +
+      geom_text(
+        data = na_cells,
+        aes(x = Time, y = Treatment_full, label = "×"),
+        inherit.aes = FALSE,
+        color = "#CFCFCF",
+        size = 4.2,
+        fontface = "plain"
+      )
+  }
+  
+  p
+}
+
+# =========================================================
+# Object checks
+# =========================================================
+
+stopifnot(
+  exists("summ_t47d"),
+  exists("summ_zr")
+)
+
+# =========================================================
+# Compute a shared color scale limit across the selected time points
+# =========================================================
+
+tmp_t47d <- summ_t47d %>%
+  filter(as.character(Time) %in% time_levels_small) %>%
+  add_log2fc_vs_control(value_col = "mean_pos")
+
+tmp_zr <- summ_zr %>%
+  filter(as.character(Time) %in% time_levels_small) %>%
+  add_log2fc_vs_control(value_col = "mean_pos")
+
+all_vals <- c(tmp_t47d$log2FC_vs_ctl0, tmp_zr$log2FC_vs_ctl0)
+all_vals <- abs(all_vals[is.finite(all_vals)])
+
+shared_lim_fc <- if (length(all_vals) == 0) {
+  1
+} else {
+  max(0.25, unname(quantile(all_vals, 0.95, na.rm = TRUE)))
+}
+
+# =========================================================
+# Final plots
+# =========================================================
+
+p_fc_t47d <- plot_heatmap_fc_small(
+  summ = summ_t47d,
+  title = "T-47D",
+  value_col = "mean_pos",
+  shared_limit = shared_lim_fc,
+  cross_on_na = TRUE
+)
+
+p_fc_zr <- plot_heatmap_fc_small(
+  summ = summ_zr,
+  title = "ZR-75-1",
+  value_col = "mean_pos",
+  shared_limit = shared_lim_fc,
+  cross_on_na = TRUE
+)
+
+fig_fc_small <- (p_fc_t47d | p_fc_zr) +
+  plot_layout(guides = "collect") &
+  theme(
+    legend.position = "right"
+  )
+
+print(fig_fc_small)
