@@ -1,6 +1,5 @@
 # KAMPR function in breast cancer cells
 
-# KAMPR breast cancer analysis
 
 This repository contains the R code used to generate the figures for our paper:
 **“The drug- and hormone-responsive lncRNA KAMPR inhibits antigen presentation and links endocrine resistance to immune-cold breast cancer.”**
