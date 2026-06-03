@@ -1,0 +1,964 @@
+
+# ------------------------------------------------------------
+# Analysis of Wu et al.scRNAseq atlas of breast tumors
+# 29/05/2026
+# Julian Primig
+# ------------------------------------------------------------
+
+# This code generates Fig. 5A, B and C.
+# It is based on the KAMPR/LINC00885 analysis in ER+ cancer epithelial cells
+# and produces violin plots for interferon-stimulated genes, the IFN signature,
+# and TGFβ signature-related genes between KAMPR+ and KAMPR- cancer cells
+
+
+# ============================================================
+# Violin plot: selected genes in ER+ Cancer Epithelial cells
+# KAMPR/LINC00885+ vs KAMPR/LINC00885-
+# Layout: 2 columns x 4 rows
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(tibble)
+  library(grid)
+})
+
+# ------------------------------------------------------------
+# 0) Parameters
+# ------------------------------------------------------------
+
+seurat_file <- "seurat_obj.rds"
+
+gene_lnc   <- "LINC00885"
+gene_label <- "KAMPR"
+
+genes_migration <- c(
+  "ISG15",
+  "IFI27",
+  "IFI6",
+  "TAPBP",
+  "PSME2"
+)
+
+cols_kampr <- c(
+  "KAMPR-" = "#A77EAA",
+  "KAMPR+" = "#7FA06A"
+)
+
+outdir <- "KAMPR_migration_violin_plots"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+# ------------------------------------------------------------
+# 1) Load Seurat object
+# ------------------------------------------------------------
+
+seurat_obj <- readRDS(seurat_file)
+
+if (!inherits(seurat_obj, "Seurat")) {
+  stop("The loaded object is not a Seurat object.")
+}
+
+DefaultAssay(seurat_obj) <- "RNA"
+
+message("Loaded object: ", seurat_file)
+message("Cells: ", ncol(seurat_obj))
+message("Features: ", nrow(seurat_obj))
+
+# ------------------------------------------------------------
+# 2) Check metadata and genes
+# ------------------------------------------------------------
+
+stopifnot(all(c("subtype", "celltype_major") %in% colnames(seurat_obj@meta.data)))
+
+if (!(gene_lnc %in% rownames(seurat_obj))) {
+  stop(
+    gene_lnc, " not found in object. Try:\n",
+    "grep('LINC00885|KAMPR|00885', rownames(seurat_obj), value = TRUE)"
+  )
+}
+
+genes_present <- genes_migration[genes_migration %in% rownames(seurat_obj)]
+genes_missing <- setdiff(genes_migration, genes_present)
+
+if (length(genes_missing) > 0) {
+  warning("Missing genes skipped: ", paste(genes_missing, collapse = ", "))
+}
+
+if (length(genes_present) == 0) {
+  stop("None of the requested genes were found in the object.")
+}
+
+gene_order <- genes_migration[genes_migration %in% genes_present]
+
+message("Genes used: ", paste(gene_order, collapse = ", "))
+
+# ------------------------------------------------------------
+# 3) Subset ER+ Cancer Epithelial cells
+# ------------------------------------------------------------
+
+er_epi_obj <- subset(
+  seurat_obj,
+  subset = subtype == "ER+" & celltype_major == "Cancer Epithelial"
+)
+
+DefaultAssay(er_epi_obj) <- "RNA"
+
+message("ER+ Cancer Epithelial cells: ", ncol(er_epi_obj))
+
+if (ncol(er_epi_obj) == 0) {
+  stop("No ER+ Cancer Epithelial cells found with subtype == 'ER+' & celltype_major == 'Cancer Epithelial'.")
+}
+
+# Optional normalization for coherence
+er_epi_obj <- NormalizeData(er_epi_obj, verbose = FALSE)
+
+# ------------------------------------------------------------
+# 4) Define KAMPR+ and KAMPR- cells
+# ------------------------------------------------------------
+
+lnc_expr <- FetchData(er_epi_obj, vars = gene_lnc)[, 1]
+
+er_epi_obj$KAMPR_status <- ifelse(
+  lnc_expr > 0,
+  "KAMPR+",
+  "KAMPR-"
+)
+
+er_epi_obj$KAMPR_status <- factor(
+  er_epi_obj$KAMPR_status,
+  levels = c("KAMPR-", "KAMPR+")
+)
+
+message("KAMPR groups:")
+print(table(er_epi_obj$KAMPR_status))
+
+# ------------------------------------------------------------
+# 5) Fetch expression data
+# ------------------------------------------------------------
+
+plot_df <- FetchData(
+  object = er_epi_obj,
+  vars = c(gene_order, "KAMPR_status")
+) %>%
+  rownames_to_column("Cell") %>%
+  pivot_longer(
+    cols = all_of(gene_order),
+    names_to = "Gene",
+    values_to = "Expression"
+  ) %>%
+  mutate(
+    Gene = factor(Gene, levels = gene_order),
+    KAMPR_status = factor(KAMPR_status, levels = c("KAMPR-", "KAMPR+"))
+  )
+
+# ------------------------------------------------------------
+# 6) Stats per gene
+# ------------------------------------------------------------
+
+stat_df <- plot_df %>%
+  group_by(Gene) %>%
+  summarise(
+    p_value = tryCatch(
+      wilcox.test(Expression ~ KAMPR_status)$p.value,
+      error = function(e) NA_real_
+    ),
+    y.position = max(Expression, na.rm = TRUE) * 1.10 + 0.05,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Gene = factor(Gene, levels = gene_order),
+    p_adj = p.adjust(p_value, method = "BH"),
+    stars = case_when(
+      is.na(p_adj)   ~ "ns",
+      p_adj < 1e-4   ~ "****",
+      p_adj < 1e-3   ~ "***",
+      p_adj < 1e-2   ~ "**",
+      p_adj < 0.05   ~ "*",
+      TRUE           ~ "ns"
+    )
+  )
+
+stat_df_sig <- stat_df %>%
+  filter(stars != "ns") %>%
+  mutate(
+    Gene    = factor(Gene, levels = gene_order),
+    x_start = 1.28,
+    x_end   = 1.72,
+    x_text  = 1.50,
+    y_line  = y.position * 0.965
+  )
+
+
+# ------------------------------------------------------------
+# 8) Violin plot
+# Layout: 2 columns x 4 rows
+# ------------------------------------------------------------
+
+p_migration_violin <- ggplot(
+  plot_df,
+  aes(x = KAMPR_status, y = Expression, fill = KAMPR_status)
+) +
+  geom_violin(
+    width = 0.82,
+    scale = "width",
+    trim = TRUE,
+    color = "#2F2F2F",
+    linewidth = 0.55,
+    alpha = 0.95
+  ) +
+  stat_summary(
+    fun = median,
+    fun.min = median,
+    fun.max = median,
+    geom = "errorbar",
+    width = 0.16,
+    linewidth = 0.75,
+    color = "#111111"
+  ) +
+  geom_segment(
+    data = stat_df_sig,
+    aes(
+      x = x_start,
+      xend = x_end,
+      y = y_line,
+      yend = y_line
+    ),
+    inherit.aes = FALSE,
+    linewidth = 0.55,
+    color = "#111111",
+    lineend = "round"
+  ) +
+  geom_text(
+    data = stat_df_sig,
+    aes(
+      x = x_text,
+      y = y.position,
+      label = stars
+    ),
+    inherit.aes = FALSE,
+    size = 3.4,
+    fontface = "bold",
+    color = "#111111"
+  ) +
+  facet_wrap(
+    ~ Gene,
+    ncol = 3,
+    nrow = 5,
+    scales = "free_y"
+  ) +
+  scale_fill_manual(
+    values = cols_kampr,
+    guide = "none"
+  ) +
+  labs(
+    x = NULL,
+    y = "norm logUMI/cell",
+    title = NULL
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      vjust = 1,
+      size = 8.5,
+      color = "black"
+    ),
+    axis.text.y = element_text(
+      size = 8,
+      color = "black"
+    ),
+    axis.title.y = element_text(
+      size = 10.5,
+      color = "black"
+    ),
+    strip.background = element_blank(),
+    strip.text = element_text(
+      size = 10.5,
+      face = "italic",
+      color = "black"
+    ),
+    legend.position = "none",
+    panel.spacing.x = unit(0.75, "lines"),
+    panel.spacing.y = unit(0.85, "lines"),
+    plot.margin = margin(10, 15, 10, 10)
+  )
+
+p_migration_violin
+
+# ---
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+### SCORE IFN
+
+
+
+# ============================================================
+# Violin plot: IFN score in ER+ Cancer Epithelial cells
+# KAMPR/LINC00885+ vs KAMPR/LINC00885-
+# Score based on selected IFN / antigen-presentation genes
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(tibble)
+  library(grid)
+})
+
+# ------------------------------------------------------------
+# 0) Parameters
+# ------------------------------------------------------------
+
+seurat_file <- "seurat_obj.rds"
+
+gene_lnc   <- "LINC00885"
+gene_label <- "KAMPR"
+
+genes_ifn <- c(
+  "ISG15",
+  "IFI27",
+  "IFI6",
+  "TAPBP",
+  "PSME2",
+  "IFI6",
+  "OAS1",
+  "MX1",
+  "IFIT1",
+  "SAMD9",
+  "PARP12",
+  "LGALS3BP",
+  "DDX58",
+  "PSME2"
+)
+
+cols_kampr <- c(
+  "KAMPR-" = "#A77EAA",
+  "KAMPR+" = "#7FA06A"
+)
+
+outdir <- "KAMPR_IFN_score_violin"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+# ------------------------------------------------------------
+# 1) Load Seurat object
+# ------------------------------------------------------------
+
+seurat_obj <- readRDS(seurat_file)
+
+if (!inherits(seurat_obj, "Seurat")) {
+  stop("The loaded object is not a Seurat object.")
+}
+
+DefaultAssay(seurat_obj) <- "RNA"
+
+message("Loaded object: ", seurat_file)
+message("Cells: ", ncol(seurat_obj))
+message("Features: ", nrow(seurat_obj))
+
+# ------------------------------------------------------------
+# 2) Check metadata and genes
+# ------------------------------------------------------------
+
+stopifnot(all(c("subtype", "celltype_major") %in% colnames(seurat_obj@meta.data)))
+
+if (!(gene_lnc %in% rownames(seurat_obj))) {
+  stop(
+    gene_lnc, " not found in object. Try:\n",
+    "grep('LINC00885|KAMPR|00885', rownames(seurat_obj), value = TRUE)"
+  )
+}
+
+genes_present <- genes_ifn[genes_ifn %in% rownames(seurat_obj)]
+genes_missing <- setdiff(genes_ifn, genes_present)
+
+if (length(genes_missing) > 0) {
+  warning("Missing genes skipped: ", paste(genes_missing, collapse = ", "))
+}
+
+if (length(genes_present) < 3) {
+  stop("Too few IFN genes found in the object to compute a robust score.")
+}
+
+message("IFN genes used: ", paste(genes_present, collapse = ", "))
+
+# ------------------------------------------------------------
+# 3) Subset ER+ Cancer Epithelial cells
+# ------------------------------------------------------------
+
+er_epi_obj <- subset(
+  seurat_obj,
+  subset = subtype == "ER+" & celltype_major == "Cancer Epithelial"
+)
+
+DefaultAssay(er_epi_obj) <- "RNA"
+
+message("ER+ Cancer Epithelial cells: ", ncol(er_epi_obj))
+
+if (ncol(er_epi_obj) == 0) {
+  stop("No ER+ Cancer Epithelial cells found with subtype == 'ER+' & celltype_major == 'Cancer Epithelial'.")
+}
+
+# Optional normalization for coherence
+er_epi_obj <- NormalizeData(er_epi_obj, verbose = FALSE)
+
+# ------------------------------------------------------------
+# 4) Define KAMPR+ and KAMPR- cells
+# ------------------------------------------------------------
+
+lnc_expr <- FetchData(er_epi_obj, vars = gene_lnc)[, 1]
+
+er_epi_obj$KAMPR_status <- ifelse(
+  lnc_expr > 0,
+  "KAMPR+",
+  "KAMPR-"
+)
+
+er_epi_obj$KAMPR_status <- factor(
+  er_epi_obj$KAMPR_status,
+  levels = c("KAMPR-", "KAMPR+")
+)
+
+message("KAMPR groups:")
+print(table(er_epi_obj$KAMPR_status))
+
+# ------------------------------------------------------------
+# 5) Compute IFN score per cell
+#    Mean of gene-wise z-scored expression values
+# ------------------------------------------------------------
+
+expr_df <- FetchData(
+  object = er_epi_obj,
+  vars = c(genes_present, "KAMPR_status")
+) %>%
+  rownames_to_column("Cell")
+
+expr_mat <- expr_df %>%
+  dplyr::select(all_of(genes_present)) %>%
+  as.matrix()
+
+# z-score each gene across cells
+expr_scaled <- scale(expr_mat)
+
+# Replace NA if a gene has zero variance
+expr_scaled[is.na(expr_scaled)] <- 0
+
+expr_df$IFN_score <- rowMeans(expr_scaled, na.rm = TRUE)
+
+plot_score_df <- expr_df %>%
+  dplyr::select(Cell, KAMPR_status, IFN_score) %>%
+  mutate(
+    KAMPR_status = factor(KAMPR_status, levels = c("KAMPR-", "KAMPR+"))
+  )
+
+# ------------------------------------------------------------
+# 6) Stats
+# ------------------------------------------------------------
+
+stat_df <- plot_score_df %>%
+  summarise(
+    p_value = tryCatch(
+      wilcox.test(IFN_score ~ KAMPR_status)$p.value,
+      error = function(e) NA_real_
+    ),
+    y.position = max(IFN_score, na.rm = TRUE) * 1.08,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    stars = case_when(
+      is.na(p_value)  ~ "ns",
+      p_value < 1e-4  ~ "****",
+      p_value < 1e-3  ~ "***",
+      p_value < 1e-2  ~ "**",
+      p_value < 0.05  ~ "*",
+      TRUE            ~ "ns"
+    ),
+    x_start = 1.28,
+    x_end   = 1.72,
+    x_text  = 1.50,
+    y_line  = y.position * 0.985
+  )
+
+stat_df_sig <- stat_df %>%
+  filter(stars != "ns")
+
+message("Wilcoxon p-value IFN score KAMPR+ vs KAMPR-: ", signif(stat_df$p_value, 3))
+message("Stars: ", stat_df$stars)
+
+
+
+# ------------------------------------------------------------
+# 8) Summary table
+# ------------------------------------------------------------
+
+summary_df <- plot_score_df %>%
+  group_by(KAMPR_status) %>%
+  summarise(
+    n_cells = n(),
+    mean_IFN_score = mean(IFN_score, na.rm = TRUE),
+    median_IFN_score = median(IFN_score, na.rm = TRUE),
+    sd_IFN_score = sd(IFN_score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(summary_df)
+
+
+# ------------------------------------------------------------
+# 9) Violin plot: IFN score
+# ------------------------------------------------------------
+
+p_ifn_score_violin <- ggplot(
+  plot_score_df,
+  aes(x = KAMPR_status, y = IFN_score, fill = KAMPR_status)
+) +
+  geom_violin(
+    width = 0.82,
+    scale = "width",
+    trim = TRUE,
+    color = "#2F2F2F",
+    linewidth = 0.60,
+    alpha = 0.95
+  ) +
+  geom_boxplot(
+    width = 0.14,
+    outlier.shape = NA,
+    linewidth = 0.45,
+    color = "#111111",
+    fill = "white",
+    alpha = 0.85
+  ) +
+  stat_summary(
+    fun = median,
+    fun.min = median,
+    fun.max = median,
+    geom = "errorbar",
+    width = 0.18,
+    linewidth = 0.85,
+    color = "#111111"
+  ) +
+  geom_segment(
+    data = stat_df_sig,
+    aes(
+      x = x_start,
+      xend = x_end,
+      y = y_line,
+      yend = y_line
+    ),
+    inherit.aes = FALSE,
+    linewidth = 0.60,
+    color = "#111111",
+    lineend = "round"
+  ) +
+  geom_text(
+    data = stat_df_sig,
+    aes(
+      x = x_text,
+      y = y.position,
+      label = stars
+    ),
+    inherit.aes = FALSE,
+    size = 4.5,
+    fontface = "bold",
+    color = "#111111"
+  ) +
+  scale_fill_manual(
+    values = cols_kampr,
+    guide = "none"
+  ) +
+  labs(
+    x = NULL,
+    y = "IFN score",
+    title = NULL
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      vjust = 1,
+      size = 11,
+      color = "black"
+    ),
+    axis.text.y = element_text(
+      size = 10,
+      color = "black"
+    ),
+    axis.title.y = element_text(
+      size = 12,
+      color = "black"
+    ),
+    legend.position = "none",
+    plot.margin = margin(10, 18, 10, 10)
+  )
+
+p_ifn_score_violin
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#### TGFB score:
+
+# ============================================================
+# Violin plot: TGFB score in ER+ Cancer Epithelial cells
+# KAMPR/LINC00885+ vs KAMPR/LINC00885-
+# Score based on selected TGFB / TGFB-like genes
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(tibble)
+  library(grid)
+})
+
+# ------------------------------------------------------------
+# 0) Parameters
+# ------------------------------------------------------------
+
+seurat_file <- "seurat_obj.rds"
+
+gene_lnc   <- "LINC00885"
+gene_label <- "KAMPR"
+
+genes_tgfb <- c(
+  "TGFB1",
+  "TGFBR1",
+  "PMEPA1",
+  "THBS1",
+  "BMP7",
+  "GDF15",
+  "TGFB3",
+  "SMAD5",
+  "ID3",
+  "FN1"
+)
+
+cols_kampr <- c(
+  "KAMPR-" = "#5F7FA3",
+  "KAMPR+" = "#C97C7C"
+)
+
+
+
+outdir <- "KAMPR_TGFB_score_violin"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+# ------------------------------------------------------------
+# 1) Load Seurat object
+# ------------------------------------------------------------
+
+seurat_obj <- readRDS(seurat_file)
+
+if (!inherits(seurat_obj, "Seurat")) {
+  stop("The loaded object is not a Seurat object.")
+}
+
+DefaultAssay(seurat_obj) <- "RNA"
+
+message("Loaded object: ", seurat_file)
+message("Cells: ", ncol(seurat_obj))
+message("Features: ", nrow(seurat_obj))
+
+# ------------------------------------------------------------
+# 2) Check metadata and genes
+# ------------------------------------------------------------
+
+stopifnot(all(c("subtype", "celltype_major") %in% colnames(seurat_obj@meta.data)))
+
+if (!(gene_lnc %in% rownames(seurat_obj))) {
+  stop(
+    gene_lnc, " not found in object. Try:\n",
+    "grep('LINC00885|KAMPR|00885', rownames(seurat_obj), value = TRUE)"
+  )
+}
+
+genes_present <- genes_tgfb[genes_tgfb %in% rownames(seurat_obj)]
+genes_missing <- setdiff(genes_tgfb, genes_present)
+
+if (length(genes_missing) > 0) {
+  warning("Missing genes skipped: ", paste(genes_missing, collapse = ", "))
+}
+
+if (length(genes_present) < 3) {
+  stop("Too few TGFB genes found in the object to compute a robust score.")
+}
+
+message("TGFB genes used: ", paste(genes_present, collapse = ", "))
+
+# ------------------------------------------------------------
+# 3) Subset ER+ Cancer Epithelial cells
+# ------------------------------------------------------------
+
+er_epi_obj <- subset(
+  seurat_obj,
+  subset = subtype == "ER+" & celltype_major == "Cancer Epithelial"
+)
+
+DefaultAssay(er_epi_obj) <- "RNA"
+
+message("ER+ Cancer Epithelial cells: ", ncol(er_epi_obj))
+
+if (ncol(er_epi_obj) == 0) {
+  stop("No ER+ Cancer Epithelial cells found with subtype == 'ER+' & celltype_major == 'Cancer Epithelial'.")
+}
+
+# Optional normalization for coherence
+er_epi_obj <- NormalizeData(er_epi_obj, verbose = FALSE)
+
+# ------------------------------------------------------------
+# 4) Define KAMPR+ and KAMPR- cells
+# ------------------------------------------------------------
+
+lnc_expr <- FetchData(er_epi_obj, vars = gene_lnc)[, 1]
+
+er_epi_obj$KAMPR_status <- ifelse(
+  lnc_expr > 0,
+  "KAMPR+",
+  "KAMPR-"
+)
+
+er_epi_obj$KAMPR_status <- factor(
+  er_epi_obj$KAMPR_status,
+  levels = c("KAMPR-", "KAMPR+")
+)
+
+message("KAMPR groups:")
+print(table(er_epi_obj$KAMPR_status))
+
+# ------------------------------------------------------------
+# 5) Compute TGFB score per cell
+#    Mean of gene-wise z-scored expression values
+# ------------------------------------------------------------
+
+expr_df <- FetchData(
+  object = er_epi_obj,
+  vars = c(genes_present, "KAMPR_status")
+) %>%
+  rownames_to_column("Cell")
+
+expr_mat <- expr_df %>%
+  dplyr::select(all_of(genes_present)) %>%
+  as.matrix()
+
+# z-score each gene across cells
+expr_scaled <- scale(expr_mat)
+
+# Replace NA if a gene has zero variance
+expr_scaled[is.na(expr_scaled)] <- 0
+
+expr_df$TGFB_score <- rowMeans(expr_scaled, na.rm = TRUE)
+
+plot_score_df <- expr_df %>%
+  dplyr::select(Cell, KAMPR_status, TGFB_score) %>%
+  mutate(
+    KAMPR_status = factor(KAMPR_status, levels = c("KAMPR-", "KAMPR+"))
+  )
+
+# ------------------------------------------------------------
+# 6) Stats
+# ------------------------------------------------------------
+
+stat_df <- plot_score_df %>%
+  summarise(
+    p_value = tryCatch(
+      wilcox.test(TGFB_score ~ KAMPR_status)$p.value,
+      error = function(e) NA_real_
+    ),
+    y.position = max(TGFB_score, na.rm = TRUE) * 1.08,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    stars = case_when(
+      is.na(p_value)  ~ "ns",
+      p_value < 1e-4  ~ "****",
+      p_value < 1e-3  ~ "***",
+      p_value < 1e-2  ~ "**",
+      p_value < 0.05  ~ "*",
+      TRUE            ~ "ns"
+    ),
+    x_start = 1.28,
+    x_end   = 1.72,
+    x_text  = 1.50,
+    y_line  = y.position * 0.985
+  )
+
+stat_df_sig <- stat_df %>%
+  filter(stars != "ns")
+
+message("Wilcoxon p-value TGFB score KAMPR+ vs KAMPR-: ", signif(stat_df$p_value, 3))
+message("Stars: ", stat_df$stars)
+
+# ------------------------------------------------------------
+# 7) Cell counts
+# ------------------------------------------------------------
+
+count_df <- plot_score_df %>%
+  distinct(Cell, KAMPR_status) %>%
+  count(KAMPR_status, name = "n_cells")
+
+message("Cell counts:")
+print(count_df)
+
+# ------------------------------------------------------------
+# 8) Summary table
+# ------------------------------------------------------------
+
+summary_df <- plot_score_df %>%
+  group_by(KAMPR_status) %>%
+  summarise(
+    n_cells = n(),
+    mean_TGFB_score = mean(TGFB_score, na.rm = TRUE),
+    median_TGFB_score = median(TGFB_score, na.rm = TRUE),
+    sd_TGFB_score = sd(TGFB_score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(summary_df)
+
+write.csv(
+  summary_df,
+  file = file.path(outdir, "TGFB_score_summary_KAMPRpos_vs_KAMPRneg.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  plot_score_df,
+  file = file.path(outdir, "TGFB_score_per_cell_KAMPRpos_vs_KAMPRneg.csv"),
+  row.names = FALSE
+)
+
+# ------------------------------------------------------------
+# 9) Violin plot: TGFB score
+# ------------------------------------------------------------
+
+p_tgfb_score_violin <- ggplot(
+  plot_score_df,
+  aes(x = KAMPR_status, y = TGFB_score, fill = KAMPR_status)
+) +
+  geom_violin(
+    width = 0.82,
+    scale = "width",
+    trim = TRUE,
+    color = "#2F2F2F",
+    linewidth = 0.60,
+    alpha = 0.95
+  ) +
+  geom_boxplot(
+    width = 0.14,
+    outlier.shape = NA,
+    linewidth = 0.45,
+    color = "#111111",
+    fill = "white",
+    alpha = 0.85
+  ) +
+  stat_summary(
+    fun = median,
+    fun.min = median,
+    fun.max = median,
+    geom = "errorbar",
+    width = 0.18,
+    linewidth = 0.85,
+    color = "#111111"
+  ) +
+  geom_segment(
+    data = stat_df_sig,
+    aes(
+      x = x_start,
+      xend = x_end,
+      y = y_line,
+      yend = y_line
+    ),
+    inherit.aes = FALSE,
+    linewidth = 0.60,
+    color = "#111111",
+    lineend = "round"
+  ) +
+  geom_text(
+    data = stat_df_sig,
+    aes(
+      x = x_text,
+      y = y.position,
+      label = stars
+    ),
+    inherit.aes = FALSE,
+    size = 4.5,
+    fontface = "bold",
+    color = "#111111"
+  ) +
+  scale_fill_manual(
+    values = cols_kampr,
+    guide = "none"
+  ) +
+  labs(
+    x = NULL,
+    y = "TGFβ score",
+    title = NULL
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      vjust = 1,
+      size = 11,
+      color = "black"
+    ),
+    axis.text.y = element_text(
+      size = 10,
+      color = "black"
+    ),
+    axis.title.y = element_text(
+      size = 12,
+      color = "black"
+    ),
+    legend.position = "none",
+    plot.margin = margin(10, 18, 10, 10)
+  )
+
+p_tgfb_score_violin
+
+
+
+
+
