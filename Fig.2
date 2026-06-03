@@ -1,0 +1,804 @@
+# ------------------------------------------------------------
+# Analysis of Wu et al.scRNAseq atlas of breast tumors
+# 29/05/2026
+# Julian Primig
+# ------------------------------------------------------------
+
+# This code generates the fig2D and fig2G:
+# KAMPR / LINC00885 analysis in ER+ Cancer Epithelial Cells
+# Differential expression, GO enrichment, selected GO plot,
+# and migration-related gene violin plots.
+
+
+###################################
+  library(Seurat)
+  library(dplyr)
+  library(tibble)
+  library(readr)
+  library(ggplot2)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(DOSE)
+  library(stringr)
+  library(forcats)
+  library(ggtext)
+  library(purrr)
+
+# ------------------------------------------------------------
+# 0) Parameters
+# ------------------------------------------------------------
+
+seurat_file <- "seurat_obj.rds"
+
+gene_lnc <- "LINC00885"
+gene_label <- "KAMPR"
+
+outdir <- "KAMPR_DE_pathway_plots"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+# Paper-like colors
+col_mhc   <- "#4E79A7"
+col_imm   <- "#E15759"
+col_ifn   <- "#76B7B2"
+col_act   <- "#F27E7E"
+col_inhib <- "#8CD17D"
+
+# ------------------------------------------------------------
+# 1) Load Seurat object
+# ------------------------------------------------------------
+
+seurat_obj <- readRDS(seurat_file)
+DefaultAssay(seurat_obj) <- "RNA"
+
+stopifnot(gene_lnc %in% rownames(seurat_obj))
+stopifnot(all(c("subtype", "celltype_major") %in% colnames(seurat_obj@meta.data)))
+
+# ------------------------------------------------------------
+# 2) Subset ER+ cancer epithelial cells
+# ------------------------------------------------------------
+
+er_epi_obj <- subset(
+  seurat_obj,
+  subset = subtype == "ER+" & celltype_major == "Cancer Epithelial"
+)
+
+DefaultAssay(er_epi_obj) <- "RNA"
+
+# Optional: re-normalize if needed
+# If your object is already normalized, this is harmless but can be skipped.
+er_epi_obj <- NormalizeData(er_epi_obj, verbose = FALSE)
+
+# ------------------------------------------------------------
+# 3) Define KAMPR/LINC00885+ and KAMPR/LINC00885- cells
+# ------------------------------------------------------------
+
+lnc_expr <- FetchData(er_epi_obj, vars = gene_lnc)[, 1]
+
+er_epi_obj$KAMPR_status <- ifelse(
+  lnc_expr > 0,
+  "KAMPR+",
+  "KAMPR-"
+)
+
+er_epi_obj$KAMPR_status <- factor(
+  er_epi_obj$KAMPR_status,
+  levels = c("KAMPR-", "KAMPR+")
+)
+
+print(table(er_epi_obj$KAMPR_status))
+
+# ------------------------------------------------------------
+# 4) Differential expression: KAMPR+ vs KAMPR-
+# ------------------------------------------------------------
+
+Idents(er_epi_obj) <- "KAMPR_status"
+
+de_kampr <- FindMarkers(
+  object = er_epi_obj,
+  ident.1 = "KAMPR+",
+  ident.2 = "KAMPR-",
+  min.pct = 0.10,
+  logfc.threshold = 0,
+  test.use = "wilcox"
+) %>%
+  rownames_to_column("gene") %>%
+  arrange(p_val_adj)
+
+write_csv(de_kampr, file.path(outdir, "DE_KAMPRpos_vs_KAMPRneg_ERpos_CEC.csv"))
+
+sig_de <- de_kampr %>%
+  filter(p_val_adj < 0.05)
+
+write_csv(sig_de, file.path(outdir, "DE_KAMPRpos_vs_KAMPRneg_ERpos_CEC_significant.csv"))
+
+# ------------------------------------------------------------
+# 5) GO BP enrichment: up and down genes
+# ------------------------------------------------------------
+
+up_genes <- sig_de %>%
+  filter(avg_log2FC > 0) %>%
+  pull(gene) %>%
+  unique()
+
+down_genes <- sig_de %>%
+  filter(avg_log2FC < 0) %>%
+  pull(gene) %>%
+  unique()
+
+up_entrez <- bitr(
+  up_genes,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+down_entrez <- bitr(
+  down_genes,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+go_up <- enrichGO(
+  gene = up_entrez$ENTREZID,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.20,
+  readable = TRUE
+)
+
+go_down <- enrichGO(
+  gene = down_entrez$ENTREZID,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.20,
+  readable = TRUE
+)
+
+write_csv(as.data.frame(go_up), file.path(outdir, "GO_BP_up_KAMPRpos.csv"))
+write_csv(as.data.frame(go_down), file.path(outdir, "GO_BP_down_KAMPRpos.csv"))
+
+
+
+
+# ============================================================
+# GO BP selected terms plot
+# Using only:
+#   GO_BP_down_KAMPRpos.csv
+#   GO_BP_up_KAMPRpos.csv
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(dplyr)
+  library(stringr)
+  library(scales)
+})
+
+# ------------------------------------------------------------
+# 1) Read files
+# ------------------------------------------------------------
+
+go_down_df <- read.csv("GO_BP_down_KAMPRpos.csv", stringsAsFactors = FALSE, check.names = FALSE)
+go_up_df   <- read.csv("GO_BP_up_KAMPRpos.csv",   stringsAsFactors = FALSE, check.names = FALSE)
+
+# ------------------------------------------------------------
+# 2) Terms to keep
+# ------------------------------------------------------------
+
+terms_down <- c(
+  "oxidative phosphorylation",
+  "antigen processing and presentation of endogenous antigen"
+)
+
+terms_up <- c(
+  "leukocyte migration",
+  "cell chemotaxis",
+  "epidermis development",
+  "wound healing",
+  "response to transforming growth factor beta",
+  "cellular response to steroid hormone stimulus"
+)
+
+# ------------------------------------------------------------
+# 3) Helper functions
+# ------------------------------------------------------------
+
+parse_gene_ratio <- function(x) {
+  sapply(as.character(x), function(z) {
+    if (grepl("/", z)) {
+      nums <- as.numeric(strsplit(z, "/")[[1]])
+      nums[1] / nums[2]
+    } else {
+      as.numeric(z)
+    }
+  })
+}
+
+extract_selected_terms <- function(df, selected_terms, group_name) {
+  
+  df2 <- df %>%
+    as.data.frame() %>%
+    dplyr::mutate(
+      Description = as.character(Description),
+      Description_lower = stringr::str_to_lower(Description),
+      GeneRatio = as.character(GeneRatio),
+      Count = as.numeric(Count),
+      p.adjust = as.numeric(p.adjust),
+      GeneRatio_num = parse_gene_ratio(GeneRatio)
+    )
+  
+  res_list <- lapply(selected_terms, function(term) {
+    
+    term_lower <- stringr::str_to_lower(term)
+    
+    hit <- df2 %>%
+      dplyr::filter(Description_lower == term_lower)
+    
+    if (nrow(hit) == 0) {
+      hit <- df2 %>%
+        dplyr::filter(stringr::str_detect(Description_lower, stringr::fixed(term_lower)))
+    }
+    
+    if (nrow(hit) == 0) {
+      stop(paste("Term not found:", term))
+    }
+    
+    hit <- hit %>%
+      dplyr::arrange(p.adjust)
+    
+    hit <- hit[1, , drop = FALSE]
+    
+    hit$Selected_label <- term
+    hit$Group <- group_name
+    hit
+  })
+  
+  dplyr::bind_rows(res_list)
+}
+
+# ------------------------------------------------------------
+# 4) Extract selected terms
+# ------------------------------------------------------------
+
+plot_down_df <- extract_selected_terms(
+  df = go_down_df,
+  selected_terms = terms_down,
+  group_name = "Downregulated"
+)
+
+plot_up_df <- extract_selected_terms(
+  df = go_up_df,
+  selected_terms = terms_up,
+  group_name = "Upregulated"
+)
+
+plot_df <- dplyr::bind_rows(plot_down_df, plot_up_df)
+
+# ------------------------------------------------------------
+# 5) Pretty labels
+# ------------------------------------------------------------
+
+label_map <- c(
+  "oxidative phosphorylation" =
+    "oxidative phosphorylation",
+  
+  "antigen processing and presentation of endogenous antigen" =
+    "antigen processing and\npresentation of endogenous antigen",
+  
+  "leukocyte migration" =
+    "leukocyte migration",
+  
+  "cell chemotaxis" =
+    "cell chemotaxis",
+  
+  "epidermis development" =
+    "epidermis development",
+  
+  "wound healing" =
+    "wound healing",
+  
+  "response to transforming growth factor beta" =
+    "response to transforming\ngrowth factor beta",
+  
+  "cellular response to steroid hormone stimulus" =
+    "cellular response to steroid\nhormone stimulus"
+)
+
+plot_df <- plot_df %>%
+  dplyr::mutate(
+    Term_label = dplyr::recode(Selected_label, !!!label_map)
+  )
+
+# ------------------------------------------------------------
+# 6) Order terms within each facet
+# ------------------------------------------------------------
+
+down_order <- c(
+  "oxidative phosphorylation",
+  "antigen processing and\npresentation of endogenous antigen"
+)
+
+up_order <- c(
+  "wound healing",
+  "response to transforming\ngrowth factor beta",
+  "cellular response to steroid\nhormone stimulus",
+  "leukocyte migration",
+  "epidermis development",
+  "cell chemotaxis"
+)
+
+plot_df <- plot_df %>%
+  dplyr::mutate(
+    Term_label = dplyr::case_when(
+      Group == "Downregulated" ~ factor(Term_label, levels = rev(down_order)),
+      Group == "Upregulated"   ~ factor(Term_label, levels = rev(up_order))
+    )
+  )
+
+# Hack for proper facet-specific ordering
+plot_df$Term_group <- paste(plot_df$Group, plot_df$Term_label, sep = "___")
+
+down_levels <- paste("Downregulated", rev(down_order), sep = "___")
+up_levels   <- paste("Upregulated",   rev(up_order),   sep = "___")
+
+plot_df$Term_group <- factor(
+  plot_df$Term_group,
+  levels = c(down_levels, up_levels)
+)
+
+term_labels_named <- c(
+  stats::setNames(rev(down_order), down_levels),
+  stats::setNames(rev(up_order), up_levels)
+)
+
+# ------------------------------------------------------------
+# 7) Small left color bars (one color per term)
+# ------------------------------------------------------------
+
+term_bar_cols <- c(
+  "oxidative phosphorylation" =
+    "#D77CEB",
+  "antigen processing and\npresentation of endogenous antigen" =
+    "#F2A340",
+  "wound healing" =
+    "#3E6F3C",
+  "response to transforming\ngrowth factor beta" =
+    "#A7D6D9",
+  "cellular response to steroid\nhormone stimulus" =
+    "#4F7FB6",
+  "leukocyte migration" =
+    "#7C7C7C",
+  "epidermis development" =
+    "#F0D84F",
+  "cell chemotaxis" =
+    "#6F6F6F"
+)
+
+plot_df$BarCol <- term_bar_cols[as.character(plot_df$Term_label)]
+
+# ------------------------------------------------------------
+# 8) Axis / plotting helpers
+# ------------------------------------------------------------
+
+x_max <- max(plot_df$GeneRatio_num, na.rm = TRUE)
+x_pad_left  <- 0.020
+x_pad_right <- 0.020
+
+tile_x <- -0.010
+tile_w <- 0.006
+
+# ------------------------------------------------------------
+# 9) Plot
+# ------------------------------------------------------------
+
+p <- ggplot(
+  plot_df,
+  aes(x = GeneRatio_num, y = Term_group)
+) +
+  
+  # small colored bar on the far left
+  geom_tile(
+    aes(x = tile_x, fill = BarCol),
+    width = tile_w,
+    height = 0.80,
+    show.legend = FALSE
+  ) +
+  
+  scale_fill_identity() +
+  
+  # lollipop segment
+  geom_segment(
+    aes(
+      x = 0,
+      xend = GeneRatio_num,
+      y = Term_group,
+      yend = Term_group,
+      color = p.adjust
+    ),
+    linewidth = 3,
+    lineend = "round"
+  ) +
+  
+  # lollipop point
+  geom_point(
+    aes(
+      size = Count,
+      color = p.adjust
+    ),
+    alpha = 0.99
+  ) +
+  
+  facet_grid(
+    Group ~ .,
+    scales = "free_y",
+    space = "free_y"
+  ) +
+  
+  scale_y_discrete(labels = term_labels_named) +
+  
+  scale_x_continuous(
+    limits = c(-x_pad_left, x_max + x_pad_right),
+    breaks = pretty(c(0, x_max), n = 4),
+    labels = function(x) ifelse(x < 0, "", sprintf("%.1f", x)),
+    expand = c(0, 0)
+  ) +
+  
+  scale_color_gradientn(
+    colours = c("#D9817D", "#B69AAA", "#5E7FA8"),
+    name = "p.adjust"
+  ) +
+  
+  scale_size_continuous(
+    name = "Gene Count",
+    range = c(5, 10)
+  ) +
+  
+  labs(
+    title = expression("GO BP CEC"^"KAMPR+/-" ~ "diff ex genes"),
+    x = "GeneRatio",
+    y = NULL
+  ) +
+  
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 18
+    ),
+    axis.title.x = element_text(
+      size = 18,
+      color = "black"
+    ),
+    axis.text.x = element_text(
+      size = 12,
+      color = "black",
+      angle = 45,
+      hjust = 1
+    ),
+    axis.text.y = element_text(
+      size = 15,
+      color = "#444444"
+    ),
+    strip.text.y = element_blank(),
+    strip.text = element_text(
+      size = 16,
+      face = "bold",
+      color = "black"
+    ),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_line(
+      color = "#D9D9D9",
+      linewidth = 0.8
+    ),
+    axis.line.x = element_blank(),
+    axis.ticks = element_blank(),
+    legend.title = element_text(size = 12, color = "black"),
+    legend.text = element_text(size = 11, color = "black"),
+    legend.position = "right",
+    
+    # augmente l'espace entre Downregulated et Upregulated
+    panel.spacing.y = unit(1.5, "cm"),
+    
+    plot.margin = margin(15, 20, 15, 20)
+  )
+p
+
+###################################
+
+
+
+
+
+
+
+###################################
+
+# ============================================================
+# Violin plot: migration-related genes in ER+ Cancer Epithelial cells
+# KAMPR/LINC00885+ vs KAMPR/LINC00885-
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(tibble)
+  library(stringr)
+  library(ggpubr)
+  library(grid)
+})
+
+# ------------------------------------------------------------
+# 0) Parameters
+# ------------------------------------------------------------
+
+seurat_file <- "seurat_obj.rds"
+
+gene_lnc   <- "LINC00885"
+gene_label <- "KAMPR"
+
+genes_migration <- c(
+  "PTK2",
+  "NEDD9",
+  "NET1",
+  "RHOA",
+  "RHOB",
+  "WASL",
+  "THBS1",
+  "MIF",
+  "RAB13"
+)
+
+cols_kampr <- c(
+  "KAMPR-" = "#9FC7AA",
+  "KAMPR+" = "#C97C7C"
+)
+
+outdir <- "KAMPR_migration_violin_plots"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+# ------------------------------------------------------------
+# 1) Load Seurat object
+# ------------------------------------------------------------
+
+seurat_obj <- readRDS(seurat_file)
+
+if (!inherits(seurat_obj, "Seurat")) {
+  stop("The loaded object is not a Seurat object.")
+}
+
+DefaultAssay(seurat_obj) <- "RNA"
+
+message("Loaded object: ", seurat_file)
+message("Cells: ", ncol(seurat_obj))
+message("Features: ", nrow(seurat_obj))
+
+# ------------------------------------------------------------
+# 2) Check metadata and genes
+# ------------------------------------------------------------
+
+stopifnot(all(c("subtype", "celltype_major") %in% colnames(seurat_obj@meta.data)))
+
+if (!(gene_lnc %in% rownames(seurat_obj))) {
+  stop(
+    gene_lnc, " not found in object. Try:\n",
+    "grep('LINC00885|KAMPR|00885', rownames(seurat_obj), value = TRUE)"
+  )
+}
+
+genes_present <- genes_migration[genes_migration %in% rownames(seurat_obj)]
+genes_missing <- setdiff(genes_migration, genes_present)
+
+if (length(genes_missing) > 0) {
+  warning("Missing genes skipped: ", paste(genes_missing, collapse = ", "))
+}
+
+if (length(genes_present) == 0) {
+  stop("None of the requested genes were found in the object.")
+}
+
+message("Genes used: ", paste(genes_present, collapse = ", "))
+
+# ------------------------------------------------------------
+# 3) Subset ER+ Cancer Epithelial cells
+# ------------------------------------------------------------
+
+er_epi_obj <- subset(
+  seurat_obj,
+  subset = subtype == "ER+" & celltype_major == "Cancer Epithelial"
+)
+
+DefaultAssay(er_epi_obj) <- "RNA"
+
+message("ER+ Cancer Epithelial cells: ", ncol(er_epi_obj))
+
+if (ncol(er_epi_obj) == 0) {
+  stop("No ER+ Cancer Epithelial cells found with subtype == 'ER+' & celltype_major == 'Cancer Epithelial'.")
+}
+
+# Optional normalization for coherence
+er_epi_obj <- NormalizeData(er_epi_obj, verbose = FALSE)
+
+# ------------------------------------------------------------
+# 4) Define KAMPR+ and KAMPR- cells
+# ------------------------------------------------------------
+
+lnc_expr <- FetchData(er_epi_obj, vars = gene_lnc)[, 1]
+
+er_epi_obj$KAMPR_status <- ifelse(
+  lnc_expr > 0,
+  "KAMPR+",
+  "KAMPR-"
+)
+
+er_epi_obj$KAMPR_status <- factor(
+  er_epi_obj$KAMPR_status,
+  levels = c("KAMPR-", "KAMPR+")
+)
+
+message("KAMPR groups:")
+print(table(er_epi_obj$KAMPR_status))
+
+# ------------------------------------------------------------
+# 5) Fetch expression data
+# ------------------------------------------------------------
+
+plot_df <- FetchData(
+  object = er_epi_obj,
+  vars = c(genes_present, "KAMPR_status")
+) %>%
+  rownames_to_column("Cell") %>%
+  pivot_longer(
+    cols = all_of(genes_present),
+    names_to = "Gene",
+    values_to = "Expression"
+  ) %>%
+  mutate(
+    Gene = factor(Gene, levels = genes_migration[genes_migration %in% genes_present]),
+    KAMPR_status = factor(KAMPR_status, levels = c("KAMPR-", "KAMPR+"))
+  )
+
+# ------------------------------------------------------------
+# 6) Stats per gene
+# ------------------------------------------------------------
+
+stat_df <- plot_df %>%
+  group_by(Gene) %>%
+  summarise(
+    p_value = tryCatch(
+      wilcox.test(Expression ~ KAMPR_status)$p.value,
+      error = function(e) NA_real_
+    ),
+    y.position = max(Expression, na.rm = TRUE) * 1.10 + 0.05,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_adj = p.adjust(p_value, method = "BH"),
+    stars = case_when(
+      is.na(p_adj)   ~ "ns",
+      p_adj < 1e-4   ~ "****",
+      p_adj < 1e-3   ~ "***",
+      p_adj < 1e-2   ~ "**",
+      p_adj < 0.05   ~ "*",
+      TRUE           ~ "ns"
+    )
+  )
+
+stat_df_sig <- stat_df %>%
+  filter(stars != "ns") %>%
+  mutate(
+    x_start = 1.28,
+    x_end   = 1.72,
+    x_text  = 1.50,
+    y_line  = y.position * 0.965
+  )
+
+
+# ------------------------------------------------------------
+# 8) Violin plot
+# 3 rows x 3 columns
+# ------------------------------------------------------------
+
+p_migration_violin <- ggplot(
+  plot_df,
+  aes(x = KAMPR_status, y = Expression, fill = KAMPR_status)
+) +
+  geom_violin(
+    width = 0.82,
+    scale = "width",
+    trim = TRUE,
+    color = "#2F2F2F",
+    linewidth = 0.55,
+    alpha = 0.95
+  ) +
+  stat_summary(
+    fun = median,
+    fun.min = median,
+    fun.max = median,
+    geom = "errorbar",
+    width = 0.16,
+    linewidth = 0.75,
+    color = "#111111"
+  ) +
+  geom_segment(
+    data = stat_df_sig,
+    aes(
+      x = x_start,
+      xend = x_end,
+      y = y_line,
+      yend = y_line
+    ),
+    inherit.aes = FALSE,
+    linewidth = 0.55,
+    color = "#111111",
+    lineend = "round"
+  ) +
+  geom_text(
+    data = stat_df_sig,
+    aes(
+      x = x_text,
+      y = y.position,
+      label = stars
+    ),
+    inherit.aes = FALSE,
+    size = 3.4,
+    fontface = "bold",
+    color = "#111111"
+  ) +
+  facet_wrap(
+    ~ Gene,
+    nrow = 3,
+    ncol = 3,
+    scales = "free_y"
+  ) +
+  scale_fill_manual(
+    values = cols_kampr,
+    guide = "none"
+  ) +
+  labs(
+    x = NULL,
+    y = "norm logUMI/cell",
+    title = NULL
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      vjust = 1,
+      size = 8.5,
+      color = "black"
+    ),
+    axis.text.y = element_text(
+      size = 8,
+      color = "black"
+    ),
+    axis.title.y = element_text(
+      size = 10.5,
+      color = "black"
+    ),
+    strip.background = element_blank(),
+    strip.text = element_text(
+      size = 10.5,
+      face = "italic",
+      color = "black"
+    ),
+    legend.position = "none",
+    panel.spacing.x = unit(0.75, "lines"),
+    panel.spacing.y = unit(0.85, "lines"),
+    plot.margin = margin(10, 15, 10, 10)
+  )
+
+
+p_migration_violin
+#######################################
+
