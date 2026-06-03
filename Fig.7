@@ -1,0 +1,1597 @@
+
+# ------------------------------------------------------------
+# Analysis of Xia et al. RNA-seq of paired responsive and resistant to endocrine therapy breast cancer
+# Analysis of snRNA-seq of responsive and unresponsive patients to letrozole treatment (FELINE trial)
+# ANalysis of TCGA data to correlate KAMPR with CTL and HLA genes with AMOCATI
+
+# 29/05/2026
+# Julian Primig
+# ------------------------------------------------------------
+
+# This code generates the fig7B, C, D, E, F, G:
+
+# This script analyzes endocrine therapy response in breast cancer by integrating
+# Xia et al. paired biopsies, FELINE letrozole snRNA-seq data, and TCGA/AMOCATI
+# outputs to assess the relationship between KAMPR/LINC00885, immune infiltration,
+# cytotoxicity, HLA genes, CTL scores, and patient survival.
+
+
+################################################################################
+### Violin plot of the immune score on responsive to letrozole compared to resistant biopsies
+### Deconvolution made with ConsensusTME
+################################################################################
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(ggplot2)
+})
+
+## 1) Charger la table
+deconv_long <- readr::read_tsv(
+  "deconv_long_with_clinical_LINC00885.tsv",
+  show_col_types = FALSE
+)
+
+## 2) Filtrer : Letrozole, consensus_tme, immune score
+imm_score <- deconv_long %>%
+  filter(
+    method == "consensus_tme",
+    clinical_label %in% c("Resp to Let", "Resist to Let"),
+    cell_type == "immune score"
+  ) %>%
+  select(
+    biopsie_id,
+    clinical_label,
+    ImmuneScore_cons = score
+  ) %>%
+  filter(!is.na(ImmuneScore_cons)) %>%
+  mutate(
+    clinical_label = factor(
+      clinical_label,
+      levels = c("Resp to Let", "Resist to Let")
+    )
+  )
+
+## 3) Test Wilcoxon
+w_imm <- wilcox.test(
+  ImmuneScore_cons ~ clinical_label,
+  data = imm_score
+)
+
+subtitle_txt <- paste0("Wilcoxon p = ", signif(w_imm$p.value, 3))
+
+## 4) Couleurs pastel
+
+paper_cols <- c(
+  "Resp to Let"   = "#8EC5A4",   # vert pastel
+  "Resist to Let" = "#E6D85C"    # jaune pastel
+)
+## 5) Plot
+p_imm_violin <- ggplot(
+  imm_score,
+  aes(x = clinical_label, y = ImmuneScore_cons, fill = clinical_label)
+) +
+  geom_violin(
+    trim = FALSE,
+    width = 0.82,
+    color = "black",
+    linewidth = 0.6,
+    alpha = 0.85
+  ) +
+  geom_boxplot(
+    width = 0.10,
+    outlier.shape = NA,
+    fill = "white",
+    color = "black",
+    linewidth = 0.35
+  ) +
+  stat_summary(
+    fun = median,
+    geom = "crossbar",
+    width = 0.08,
+    linewidth = 0.8,
+    color = "black"
+  ) +
+  scale_fill_manual(values = paper_cols, guide = "none") +
+  labs(
+    title = "Immune infiltration",
+    subtitle = subtitle_txt,
+    x = NULL,
+    y = "Immune score (ConsensusTME)"
+  ) +
+  theme_classic(base_size = 9) +
+  theme(
+    plot.title = element_text(face = "bold", size = 10, hjust = 0.5),
+    plot.subtitle = element_text(size = 8, hjust = 0.5, color = "grey30"),
+    axis.title.y = element_text(size = 9, color = "black"),
+    axis.text.x = element_text(
+      size = 8,
+      color = "black",
+      angle = 45,
+      hjust = 1,
+      vjust = 1
+    ),
+    axis.text.y = element_text(size = 8, color = "black"),
+    axis.line = element_line(linewidth = 0.4, color = "black"),
+    axis.ticks = element_line(linewidth = 0.4, color = "black"),
+    legend.position = "none"
+  )
+
+print(p_imm_violin)
+
+################################################################
+
+
+
+
+
+
+################################################################
+
+## =========================================================
+## Show KAMPR differential expression inside each patient with paired biopsies of responsive then acquired resistance
+## - Loads deconv_long from disk
+## =========================================================
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(ggplot2)
+  library(patchwork)
+})
+
+## -------------------------
+## 0) Load data 
+## -------------------------
+deconv_file <- "deconv_long_with_clinical_LINC00885.tsv"  
+stopifnot(file.exists(deconv_file))
+deconv_long <- readr::read_tsv(deconv_file, show_col_types = FALSE)
+
+req <- c("biopsie_id","clinical_label","method","cell_type","score","LINC00885")
+miss <- setdiff(req, names(deconv_long))
+if (length(miss) > 0) stop("Missing columns in deconv_long: ", paste(miss, collapse = ", "))
+
+## -------------------------
+## 1) Settings
+## -------------------------
+drug_label <- c(Let = "Letrozole", Tam = "Tamoxifen")
+cols       <- c("Letrozole" = "lightcoral", "Tamoxifen" = "steelblue")
+
+exclude_patients <- c("015","017","018")
+priority_good    <- c("007","024","006","016","026","019","020")
+
+highlight_fill  <- "lightgoldenrod1"
+highlight_alpha <- 0.35
+
+## -------------------------
+## 2) Build per-biopsy table (robust to duplicates)
+## -------------------------
+imm_per_biopsy <- deconv_long %>%
+  dplyr::filter(method == "consensus_tme", cell_type == "immune score") %>%
+  dplyr::select(biopsie_id, ImmuneScore = score)
+
+meta_per_biopsy <- deconv_long %>%
+  group_by(biopsie_id, clinical_label) %>%
+  summarise(
+    LINC00885 = dplyr::first(LINC00885[!is.na(LINC00885)]),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    patient_id = str_extract(biopsie_id, "^[0-9]{3}"),
+    sample_id  = biopsie_id,
+    sample_num = suppressWarnings(as.numeric(str_extract(sample_id, "(?<=^[0-9]{3}-)\\d+")))
+  ) %>%
+  rename(KAMPR = LINC00885)
+
+df_biopsy <- meta_per_biopsy %>%
+  left_join(imm_per_biopsy, by = "biopsie_id")
+
+## -------------------------
+## 3) Parse treatment/state + remove "Rec on Let" + EXCLUDE patients
+## -------------------------
+df2 <- df_biopsy %>%
+  mutate(
+    drug_code = case_when(
+      str_detect(clinical_label, regex("Let", TRUE)) ~ "Let",
+      str_detect(clinical_label, regex("Tam", TRUE)) ~ "Tam",
+      TRUE ~ NA_character_
+    ),
+    state = case_when(
+      str_detect(clinical_label, regex("^\\s*Resp", TRUE))      ~ "Responsive",
+      str_detect(clinical_label, regex("^\\s*Resist", TRUE))    ~ "Resistant",
+      str_detect(clinical_label, regex("^\\s*Rec\\s+on", TRUE)) ~ "Resistant",
+      TRUE ~ NA_character_
+    ),
+    rec_on_let = str_detect(clinical_label, regex("^\\s*Rec\\s*on\\s*Let", TRUE)),
+    Treatment  = drug_label[drug_code]
+  ) %>%
+  filter(!is.na(Treatment), !is.na(state), !rec_on_let) %>%
+  filter(!patient_id %in% exclude_patients)
+
+## -------------------------
+## 4) Helper: compute Δ table (paired + cross-drug)
+## -------------------------
+make_delta_table <- function(df_in, value_col) {
+  
+  df_summ <- df_in %>%
+    filter(!is.na(.data[[value_col]])) %>%
+    group_by(patient_id, Treatment, state) %>%
+    summarise(value = mean(.data[[value_col]], na.rm = TRUE), .groups = "drop")
+  
+  resp_last <- df_in %>%
+    filter(state == "Responsive", !is.na(.data[[value_col]])) %>%
+    group_by(patient_id) %>%
+    arrange(sample_num, .by_group = TRUE) %>%
+    summarise(resp_last = dplyr::last(.data[[value_col]]), .groups = "drop")
+  
+  paired_all <- df_summ %>%
+    pivot_wider(names_from = state, values_from = value) %>%
+    filter(!is.na(Responsive), !is.na(Resistant)) %>%
+    mutate(delta = Resistant - Responsive)
+  
+  cross_all <- df_in %>%
+    filter(state == "Resistant", !is.na(.data[[value_col]])) %>%
+    group_by(patient_id, Treatment) %>%
+    summarise(res_drug = mean(.data[[value_col]], na.rm = TRUE), .groups = "drop") %>%
+    inner_join(resp_last, by = "patient_id") %>%
+    mutate(delta = res_drug - resp_last) %>%
+    anti_join(paired_all %>% select(patient_id, Treatment),
+              by = c("patient_id", "Treatment"))
+  
+  bind_rows(
+    paired_all %>% select(patient_id, Treatment, delta),
+    cross_all  %>% select(patient_id, Treatment, delta)
+  ) %>%
+    filter(is.finite(delta))
+}
+
+df_kampr <- make_delta_table(df2, "KAMPR")
+df_imm   <- make_delta_table(df2, "ImmuneScore")
+
+## -------------------------
+## 5) Patient universe + Order
+## -------------------------
+patient_universe <- sort(unique(c(df_kampr$patient_id, df_imm$patient_id)))
+
+pat_k <- df_kampr %>% group_by(patient_id) %>% summarise(delta_k = median(delta), .groups = "drop")
+pat_i <- df_imm   %>% group_by(patient_id) %>% summarise(delta_i = median(delta), .groups = "drop")
+
+pat_sum <- tibble(patient_id = patient_universe) %>%
+  left_join(pat_k, by = "patient_id") %>%
+  left_join(pat_i, by = "patient_id") %>%
+  mutate(
+    good = is.finite(delta_k) & is.finite(delta_i) & delta_k > 0 & delta_i < 0,
+    score = ifelse(is.finite(delta_k), delta_k, -Inf) -
+      ifelse(is.finite(delta_i), delta_i, Inf),
+    priority_rank = match(patient_id, priority_good),
+    priority_rank = ifelse(is.na(priority_rank), Inf, priority_rank)
+  )
+
+good_order <- pat_sum %>%
+  filter(good) %>%
+  arrange(priority_rank, desc(delta_k), delta_i, patient_id) %>%
+  pull(patient_id)
+
+other_order <- pat_sum %>%
+  filter(!good) %>%
+  arrange(desc(score), patient_id) %>%
+  pull(patient_id)
+
+patient_levels_top   <- c(good_order, other_order)
+levels_bottom_to_top <- rev(patient_levels_top)
+good6_top <- head(good_order, 6)
+
+df_kampr2 <- df_kampr %>% mutate(patient_id_f = factor(patient_id, levels = levels_bottom_to_top))
+df_imm2   <- df_imm   %>% mutate(patient_id_f = factor(patient_id, levels = levels_bottom_to_top))
+
+## -------------------------
+## 6) Highlight band behind TOP 6 good profiles
+## -------------------------
+levs <- levels(df_kampr2$patient_id_f)
+idx  <- match(good6_top, levs)
+idx  <- idx[!is.na(idx)]
+
+highlight_band <- if (length(idx) > 0) {
+  data.frame(
+    xmin = -Inf, xmax = Inf,
+    ymin = min(idx) - 0.5,
+    ymax = max(idx) + 0.5
+  )
+} else NULL
+
+## -------------------------
+## 7) Wilcoxon p-value only (same settings as reference)
+## -------------------------
+wilcox_p_only <- function(delta_vec) {
+  delta_vec <- delta_vec[is.finite(delta_vec)]
+  if (length(delta_vec) == 0) return(NA_real_)
+  wilcox.test(delta_vec, mu = 0, conf.int = TRUE, conf.level = 0.95, exact = FALSE)$p.value
+}
+
+p_k <- wilcox_p_only(df_kampr2$delta)
+p_i <- wilcox_p_only(df_imm2$delta)
+
+sub_k <- if (is.finite(p_k)) paste0("Wilcoxon (μ=0): p = ", format.pval(p_k, digits = 3, eps = 1e-3)) else "Wilcoxon (μ=0): p = NA"
+sub_i <- if (is.finite(p_i)) paste0("Wilcoxon (μ=0): p = ", format.pval(p_i, digits = 3, eps = 1e-3)) else "Wilcoxon (μ=0): p = NA"
+
+## -------------------------
+## 8) Plot function (+ subtitle p only)
+## -------------------------
+plot_delta <- function(df_plot, title, subtitle, xlab, show_y = TRUE) {
+  
+  ggplot(df_plot, aes(x = delta, y = patient_id_f, color = Treatment)) +
+    { if (!is.null(highlight_band))
+      geom_rect(
+        data = highlight_band,
+        aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+        inherit.aes = FALSE,
+        fill = highlight_fill,
+        alpha = highlight_alpha,
+        color = NA
+      )
+    } +
+    geom_vline(xintercept = 0, linetype = 2) +
+    geom_point(shape = 16, size = 2,
+               position = position_jitter(width = 0, height = 0.08)) +
+    scale_color_manual(values = cols, drop = TRUE, name = "") +
+    scale_y_discrete(drop = TRUE) +
+    labs(
+      title = title,
+      subtitle = subtitle,
+      x = xlab,
+      y = if (show_y) "aR patients" else NULL
+    ) +
+    theme_minimal(base_size = 10) +
+    theme(
+      legend.position = "right",
+      plot.title = element_text(margin = margin(b = 4)),
+      plot.subtitle = element_text(margin = margin(b = 8), color = "grey25"),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor.y = element_blank()
+    ) +
+    guides(color = guide_legend(override.aes = list(shape = 16)))
+}
+
+p_kampr <- plot_delta(
+  df_kampr2,
+  title    = "Δ KAMPR",
+  subtitle = sub_k,
+  xlab     = expression(Delta~"KAMPR (Resist \u2212 Resp)"),
+  show_y   = TRUE
+)
+
+p_imm <- plot_delta(
+  df_imm2,
+  title    = "Δ Immune score",
+  subtitle = sub_i,
+  xlab     = expression(Delta~"Immune score (Resist \u2212 Resp)"),
+  show_y   = FALSE
+) +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+(p_kampr | p_imm) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "right")
+
+########################################################################
+
+
+
+
+
+
+
+
+
+
+
+
+
+## =========================================================
+## Scatter plots:
+## - KAMPR vs Immune score
+## - KAMPR vs Cytotoxicity score
+## One shared legend on the right
+## Keep Adj lm in subtitle
+## =========================================================
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(ggplot2)
+  library(patchwork)
+  library(grid)
+})
+
+## =========================================================
+## 1) Charger la table
+## =========================================================
+if (!exists("deconv_long")) {
+  deconv_long <- readr::read_tsv(
+    "deconv_long_with_clinical_LINC00885.tsv",
+    show_col_types = FALSE
+  )
+}
+
+## =========================================================
+## 2) Filtrer : Letrozole + consensusTME
+## =========================================================
+deconv_let <- deconv_long %>%
+  filter(
+    clinical_label %in% c("Resp to Let", "Resist to Let"),
+    method == "consensus_tme"
+  ) %>%
+  mutate(
+    clinical_label = factor(
+      clinical_label,
+      levels = c("Resp to Let", "Resist to Let")
+    )
+  )
+
+## =========================================================
+## 3) Construire les tables Immune score et Cytotoxicity score
+## =========================================================
+
+## Immune score
+imm_score <- deconv_let %>%
+  filter(cell_type == "immune score") %>%
+  select(
+    biopsie_id,
+    clinical_label,
+    KAMPR = LINC00885,
+    ImmuneScore_cons = score
+  ) %>%
+  filter(
+    !is.na(KAMPR),
+    !is.na(ImmuneScore_cons)
+  )
+
+## Cytotoxicity score
+cyto_score <- deconv_let %>%
+  filter(cell_type == "cytotoxicity score") %>%
+  select(
+    biopsie_id,
+    clinical_label,
+    KAMPR = LINC00885,
+    CytoScore = score
+  ) %>%
+  filter(
+    !is.na(KAMPR),
+    !is.na(CytoScore)
+  )
+
+## =========================================================
+## 4) Modèles ajustés : score ~ clinical_label + KAMPR
+## =========================================================
+
+## Immune score
+m_imm <- lm(ImmuneScore_cons ~ clinical_label + KAMPR, data = imm_score)
+coef_imm <- summary(m_imm)$coefficients
+beta_imm <- unname(coef_imm["KAMPR", "Estimate"])
+p_imm    <- unname(coef_imm["KAMPR", "Pr(>|t|)"])
+label_imm <- sprintf("Adj lm: beta = %.3f, p = %.3g", beta_imm, p_imm)
+
+## Cytotoxicity score
+m_cyto <- lm(CytoScore ~ clinical_label + KAMPR, data = cyto_score)
+coef_cyto <- summary(m_cyto)$coefficients
+beta_cyto <- unname(coef_cyto["KAMPR", "Estimate"])
+p_cyto    <- unname(coef_cyto["KAMPR", "Pr(>|t|)"])
+label_cyto <- sprintf("Adj lm: beta = %.3f, p = %.3g", beta_cyto, p_cyto)
+
+## =========================================================
+## 5) Couleurs
+## =========================================================
+cols <- c(
+  "Resp to Let"   = "#8FAFD1",
+  "Resist to Let" = "#D8A2A2"
+)
+
+## =========================================================
+## 6) Thème commun
+## =========================================================
+theme_scatter <- theme_classic(base_size = 7) +
+  theme(
+    panel.grid       = element_blank(),
+    panel.border     = element_blank(),
+    
+    plot.title       = element_text(face = "bold", size = 7.5, hjust = 0.5),
+    plot.subtitle    = element_text(size = 6, hjust = 0.5),
+    
+    axis.title.x     = element_text(size = 6.5),
+    axis.title.y     = element_text(size = 6.5),
+    axis.text.x      = element_text(size = 6),
+    axis.text.y      = element_text(size = 6),
+    axis.line        = element_line(linewidth = 0.3, color = "black"),
+    axis.ticks       = element_line(linewidth = 0.3, color = "black"),
+    
+    legend.position  = "right",
+    legend.title     = element_text(size = 6),
+    legend.text      = element_text(size = 5.5),
+    legend.key.size  = unit(0.35, "cm"),
+    
+    plot.margin      = margin(4, 4, 4, 4)
+  )
+
+## =========================================================
+## 7) Plot Immune score
+## =========================================================
+p_imm_scatter <- ggplot(
+  imm_score,
+  aes(x = KAMPR, y = ImmuneScore_cons)
+) +
+  geom_smooth(
+    aes(color = clinical_label, fill = clinical_label),
+    method = "lm",
+    se = TRUE,
+    fullrange = TRUE,
+    linewidth = 0.5,
+    alpha = 0.14,
+    show.legend = FALSE
+  ) +
+  geom_point(
+    aes(fill = clinical_label),
+    shape = 21,
+    color = "black",
+    stroke = 0.35,
+    alpha = 0.9,
+    size = 1.5
+  ) +
+  scale_color_manual(values = cols, guide = "none") +
+  scale_fill_manual(values = cols, name = "Group") +
+  labs(
+    title    = "Immune score",
+    subtitle = label_imm,
+    x        = "KAMPR (log2 + z-scored)",
+    y        = "Immune score"
+  ) +
+  theme_scatter
+
+## =========================================================
+## 8) Plot Cytotoxicity score
+## =========================================================
+p_cyto_scatter <- ggplot(
+  cyto_score,
+  aes(x = KAMPR, y = CytoScore)
+) +
+  geom_smooth(
+    aes(color = clinical_label, fill = clinical_label),
+    method = "lm",
+    se = TRUE,
+    fullrange = TRUE,
+    linewidth = 0.5,
+    alpha = 0.14,
+    show.legend = FALSE
+  ) +
+  geom_point(
+    aes(fill = clinical_label),
+    shape = 21,
+    color = "black",
+    stroke = 0.35,
+    alpha = 0.9,
+    size = 1.5
+  ) +
+  scale_color_manual(values = cols, guide = "none") +
+  scale_fill_manual(values = cols, name = "Group") +
+  labs(
+    title    = "Cytotoxicity score",
+    subtitle = label_cyto,
+    x        = "KAMPR (log2 + z-scored)",
+    y        = "Cytotoxicity score"
+  ) +
+  theme_scatter
+
+## =========================================================
+## 9) Figure combinée avec une seule légende à droite
+## =========================================================
+fig_scatter <- (p_imm_scatter | p_cyto_scatter) +
+  plot_layout(guides = "collect") &
+  theme(
+    legend.position = "right",
+    legend.title    = element_text(size = 6),
+    legend.text     = element_text(size = 5.5)
+  )
+
+print(fig_scatter)
+
+
+
+
+
+
+# ============================================================
+# ANALYSIS OF FELINE TRIAL DATA downloaded at GSE211434
+# Row 1: cancer-cell UMAP by day, colored by response
+# Row 2: pooled percentage of KAMPR+ cancer cells
+# Row 3: KAMPR expression in KAMPR+ cancer cells
+# data were first merged into a global rds file named: FELINE_allcells_Seurat.rds
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(ggplot2)
+  library(patchwork)
+  library(scales)
+  library(grid)
+})
+
+dir.create("plots", showWarnings = FALSE, recursive = TRUE)
+
+# ------------------------------------------------------------
+# 0) Parameters
+# ------------------------------------------------------------
+
+rds_path <- "FELINE_allcells_Seurat.rds"
+
+gene_use <- "LINC00885"
+gene_label_plot <- "KAMPR"
+
+treatment_target <- "Letrozole alone"
+
+n_hvg <- 3000
+n_pcs <- 20
+cluster_res <- 0.4
+
+day_levels <- c("D0", "D14", "D180")
+
+condition_cols <- c(
+  "Response"     = "#4E79A7",
+  "Non-Response" = "#E15759"
+)
+
+# ------------------------------------------------------------
+# 1) Plot themes
+# ------------------------------------------------------------
+
+theme_feline_clean <- function(base_size = 10) {
+  theme_classic(base_size = base_size) +
+    theme(
+      axis.line = element_line(color = "black", linewidth = 0.35),
+      axis.ticks = element_line(color = "black", linewidth = 0.35),
+      axis.text = element_text(color = "black"),
+      axis.title = element_text(face = "bold", color = "black"),
+      strip.background = element_blank(),
+      strip.text = element_text(face = "bold", size = base_size + 1),
+      legend.title = element_text(face = "bold", size = base_size),
+      legend.text = element_text(size = base_size - 1),
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5, color = "grey30"),
+      panel.spacing = unit(1.0, "lines")
+    )
+}
+
+theme_umap_response <- function(base_size = 10) {
+  theme_void(base_size = base_size) +
+    theme(
+      strip.background = element_blank(),
+      strip.text = element_text(face = "bold", size = base_size + 1),
+      legend.title = element_text(face = "bold", size = base_size),
+      legend.text = element_text(size = base_size - 1),
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5, color = "grey30"),
+      panel.spacing = unit(1.0, "lines"),
+      plot.margin = margin(4, 6, 2, 6)
+    )
+}
+
+# ------------------------------------------------------------
+# 2) Load global Seurat object
+# ------------------------------------------------------------
+
+if (!file.exists(rds_path)) {
+  stop("File not found: ", rds_path)
+}
+
+obj <- readRDS(rds_path)
+
+if (!inherits(obj, "Seurat")) {
+  stop("The loaded object is not a Seurat object.")
+}
+
+DefaultAssay(obj) <- "RNA"
+
+cat("\nLoaded object: ", rds_path, "\n")
+cat("Dimensions: ", nrow(obj), " features x ", ncol(obj), " cells\n", sep = "")
+
+# ------------------------------------------------------------
+# 3) Check required metadata
+# ------------------------------------------------------------
+
+meta_cols <- colnames(obj@meta.data)
+
+needed_global <- c("Treatment", "Day", "CellType", "CellTypeSubtype")
+missing_global <- setdiff(needed_global, meta_cols)
+
+if (length(missing_global) > 0) {
+  stop("Missing metadata columns: ", paste(missing_global, collapse = ", "))
+}
+
+if (!("Patient" %in% meta_cols || "patient_id" %in% meta_cols)) {
+  stop("No patient column found: neither 'Patient' nor 'patient_id'.")
+}
+
+if (!(gene_use %in% rownames(obj))) {
+  stop(gene_use, " is not present in the Seurat object.")
+}
+
+patient_col <- if ("Patient" %in% meta_cols) "Patient" else "patient_id"
+
+# ------------------------------------------------------------
+# 4) Clean and harmonize metadata
+# ------------------------------------------------------------
+
+obj$Treatment_plot <- trimws(as.character(obj$Treatment))
+obj$CellType_plot <- as.character(obj$CellType)
+obj$CellTypeSubtype_plot <- as.character(obj$CellTypeSubtype)
+obj$Patient_plot <- as.character(obj@meta.data[[patient_col]])
+
+# Harmonize day labels
+day_raw <- as.character(obj$Day)
+day_raw <- gsub("^D", "", day_raw, ignore.case = TRUE)
+
+obj$Day_plot <- factor(
+  day_raw,
+  levels = c("0", "14", "180"),
+  labels = c("D0", "D14", "D180")
+)
+
+# Build binary clinical response
+if ("ResponseBin" %in% colnames(obj@meta.data)) {
+  
+  resp_bin <- trimws(as.character(obj$ResponseBin))
+  
+  obj$ResponseBin <- case_when(
+    resp_bin %in% c("Response", "Responder", "Yes", "Y", "1", "TRUE", "True") ~ "Response",
+    resp_bin %in% c("Non-response", "Non-Response", "Non responder", "Nonresponder",
+                    "NR", "No", "N", "0", "FALSE", "False") ~ "Non-response",
+    TRUE ~ NA_character_
+  )
+  
+} else if ("ResponseYN" %in% colnames(obj@meta.data)) {
+  
+  respyn <- trimws(as.character(obj$ResponseYN))
+  
+  obj$ResponseBin <- case_when(
+    respyn %in% c("Response", "Responder", "R", "Yes", "Y", "1", "TRUE", "True") ~ "Response",
+    respyn %in% c("Non-response", "Non-Response", "Non responder", "Nonresponder",
+                  "NR", "No", "N", "0", "FALSE", "False") ~ "Non-response",
+    TRUE ~ NA_character_
+  )
+  
+} else if ("Response" %in% colnames(obj@meta.data)) {
+  
+  resp <- trimws(as.character(obj$Response))
+  
+  obj$ResponseBin <- case_when(
+    resp %in% c("Sustained response", "Partial response", "Response", "Responder") ~ "Response",
+    resp %in% c("Stable disease", "Rebound disease", "Progressive disease",
+                "Non-response", "Non-Response", "Non responder", "Nonresponder") ~ "Non-response",
+    TRUE ~ NA_character_
+  )
+  
+} else {
+  stop("Cannot build ResponseBin: no ResponseBin, ResponseYN, or Response column found.")
+}
+
+obj$ResponseBin <- factor(obj$ResponseBin, levels = c("Response", "Non-response"))
+
+cat("\nTreatment_plot:\n")
+print(table(obj$Treatment_plot, useNA = "ifany"))
+
+cat("\nDay_plot:\n")
+print(table(obj$Day_plot, useNA = "ifany"))
+
+cat("\nResponseBin:\n")
+print(table(obj$ResponseBin, useNA = "ifany"))
+
+# ------------------------------------------------------------
+# 5) Keep only Letrozole alone cells
+# ------------------------------------------------------------
+
+cells_let <- colnames(obj)[
+  tolower(obj$Treatment_plot) == tolower(treatment_target) &
+    !is.na(obj$Day_plot) &
+    !is.na(obj$ResponseBin)
+]
+
+if (length(cells_let) == 0) {
+  stop("No cells found for Treatment == ", treatment_target)
+}
+
+obj_let <- subset(obj, cells = cells_let)
+
+cat("\nNumber of Letrozole alone cells: ", ncol(obj_let), "\n", sep = "")
+
+# ------------------------------------------------------------
+# 6) Identify cancer cells
+# ------------------------------------------------------------
+
+obj_let$is_cancer <- obj_let$CellType_plot == "Cancer cells" |
+  obj_let$CellTypeSubtype_plot == "Cancer cells" |
+  grepl("cancer|tumou?r|carcinoma|malig", obj_let$CellType_plot, ignore.case = TRUE) |
+  grepl("cancer|tumou?r|carcinoma|malig", obj_let$CellTypeSubtype_plot, ignore.case = TRUE)
+
+cat("\nTable is_cancer:\n")
+print(table(obj_let$is_cancer, useNA = "ifany"))
+
+if (sum(obj_let$is_cancer, na.rm = TRUE) == 0) {
+  stop("No cancer cells detected.")
+}
+
+cells_cancer <- colnames(obj_let)[obj_let$is_cancer]
+obj_cancer <- subset(obj_let, cells = cells_cancer)
+
+cat("\nNumber of cancer cells: ", ncol(obj_cancer), "\n", sep = "")
+
+# ------------------------------------------------------------
+# 7) Recompute cancer-only UMAP
+# ------------------------------------------------------------
+
+DefaultAssay(obj_cancer) <- "RNA"
+
+obj_cancer <- NormalizeData(obj_cancer)
+
+obj_cancer <- FindVariableFeatures(
+  obj_cancer,
+  selection.method = "vst",
+  nfeatures = n_hvg
+)
+
+features_use <- unique(c(VariableFeatures(obj_cancer), gene_use))
+features_use <- features_use[features_use %in% rownames(obj_cancer)]
+
+obj_cancer <- ScaleData(obj_cancer, features = features_use)
+obj_cancer <- RunPCA(obj_cancer, features = features_use, npcs = 30)
+obj_cancer <- FindNeighbors(obj_cancer, dims = 1:n_pcs)
+obj_cancer <- FindClusters(obj_cancer, resolution = cluster_res)
+obj_cancer <- RunUMAP(obj_cancer, dims = 1:n_pcs)
+
+# ------------------------------------------------------------
+# 8) Extract UMAP coordinates, expression, and metadata
+# ------------------------------------------------------------
+
+umap_mat <- Embeddings(obj_cancer, reduction = "umap") %>%
+  as.data.frame()
+
+colnames(umap_mat)[1:2] <- c("UMAP_1", "UMAP_2")
+
+plot_df <- FetchData(
+  obj_cancer,
+  vars = c(gene_use, "Day_plot", "ResponseBin", "Patient_plot")
+) %>%
+  bind_cols(umap_mat) %>%
+  mutate(
+    expr = .data[[gene_use]],
+    Day_plot = factor(as.character(Day_plot), levels = day_levels),
+    Response_plot = case_when(
+      as.character(ResponseBin) %in% c("Response", "Responder", "Yes", "Y", "1", "TRUE", "True") ~ "Response",
+      as.character(ResponseBin) %in% c("Non-response", "Non-Response", "Non responder",
+                                       "Nonresponder", "NR", "No", "N", "0", "FALSE", "False") ~ "Non-Response",
+      TRUE ~ NA_character_
+    ),
+    Response_plot = factor(Response_plot, levels = c("Response", "Non-Response")),
+    Patient_plot = as.character(Patient_plot),
+    KAMPR_pos = expr > 0
+  ) %>%
+  filter(
+    !is.na(Day_plot),
+    !is.na(Response_plot),
+    !is.na(Patient_plot),
+    !is.na(expr)
+  )
+
+cat("\nCancer cells used in the figure:\n")
+print(table(plot_df$Day_plot, plot_df$Response_plot, useNA = "ifany"))
+
+# ------------------------------------------------------------
+# 9) Build x-axis labels with patient numbers
+# ------------------------------------------------------------
+
+n_label_df <- plot_df %>%
+  distinct(Day_plot, Response_plot, Patient_plot) %>%
+  count(Day_plot, Response_plot, name = "n_patients") %>%
+  mutate(
+    Response_x_unique = paste(Day_plot, Response_plot, sep = "__"),
+    x_label = paste0(Response_plot, "\n(n=", n_patients, ")")
+  )
+
+plot_df <- plot_df %>%
+  mutate(
+    Response_x_unique = paste(Day_plot, Response_plot, sep = "__")
+  ) %>%
+  left_join(
+    n_label_df %>%
+      select(Day_plot, Response_plot, Response_x_unique, x_label, n_patients),
+    by = c("Day_plot", "Response_plot", "Response_x_unique")
+  ) %>%
+  mutate(
+    Response_x_unique = factor(
+      Response_x_unique,
+      levels = c(
+        paste(day_levels, "Response", sep = "__"),
+        paste(day_levels, "Non-Response", sep = "__")
+      )
+    )
+  )
+
+x_labels_unique <- n_label_df %>%
+  arrange(Day_plot, Response_plot) %>%
+  { setNames(.$x_label, .$Response_x_unique) }
+
+# ------------------------------------------------------------
+# 10) UMAP by day, colored by clinical response
+# ------------------------------------------------------------
+
+set.seed(123)
+
+umap_df <- plot_df %>%
+  sample_frac(1)
+
+p_umap_response <- ggplot(
+  umap_df,
+  aes(x = UMAP_1, y = UMAP_2, color = Response_plot)
+) +
+  geom_point(
+    size = 0.8,
+    alpha = 0.75,
+    stroke = 0
+  ) +
+  facet_wrap(~Day_plot, nrow = 1) +
+  scale_color_manual(values = condition_cols, drop = FALSE) +
+  coord_equal() +
+  labs(
+    title = "",
+    color = "Response"
+  ) +
+  theme_umap_response(base_size = 10) +
+  theme(
+    legend.position = "right"
+  )
+
+# ------------------------------------------------------------
+# 11) Barplot of pooled percentage of KAMPR+ cancer cells
+# ------------------------------------------------------------
+
+bar_df <- plot_df %>%
+  group_by(Day_plot, Response_plot, Response_x_unique, x_label) %>%
+  summarise(
+    n_total_tumor_cells = n(),
+    n_KAMPR_pos = sum(KAMPR_pos, na.rm = TRUE),
+    pct_KAMPR_pos = 100 * mean(KAMPR_pos, na.rm = TRUE),
+    n_patients = n_distinct(Patient_plot),
+    .groups = "drop"
+  )
+
+cat("\nPooled % KAMPR+ summary:\n")
+print(bar_df)
+
+write.csv(
+  bar_df,
+  "plots/CANCER_LetrozoleAlone_KAMPR_pct_positive_pooled_Day_Response.csv",
+  row.names = FALSE
+)
+
+p_bar_kampr_pct <- ggplot(
+  bar_df,
+  aes(x = Response_x_unique, y = pct_KAMPR_pos, fill = Response_plot)
+) +
+  geom_col(
+    width = 0.62,
+    color = NA,
+    alpha = 0.92
+  ) +
+  geom_text(
+    aes(label = paste0(round(pct_KAMPR_pos, 1), "%")),
+    vjust = -0.45,
+    size = 3.0,
+    fontface = "bold",
+    color = "black"
+  ) +
+  facet_wrap(~Day_plot, nrow = 1, scales = "free_x") +
+  scale_fill_manual(values = condition_cols, drop = FALSE) +
+  scale_x_discrete(labels = x_labels_unique) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.20))
+  ) +
+  labs(
+    x = NULL,
+    y = "% KAMPR+ cancer cells"
+  ) +
+  theme_feline_clean(base_size = 10) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      vjust = 1,
+      face = "bold"
+    ),
+    legend.position = "none",
+    plot.margin = margin(2, 6, 2, 6)
+  )
+
+# ------------------------------------------------------------
+# 12) Scatter plot of KAMPR expression in KAMPR+ cells
+# ------------------------------------------------------------
+
+scatter_pos_df <- plot_df %>%
+  filter(KAMPR_pos)
+
+cat("\nKAMPR+ cancer cells:\n")
+print(table(scatter_pos_df$Day_plot, scatter_pos_df$Response_plot, useNA = "ifany"))
+
+scatter_summary_df <- scatter_pos_df %>%
+  group_by(Day_plot, Response_plot) %>%
+  summarise(
+    n_cells_pos = n(),
+    n_patients = n_distinct(Patient_plot),
+    median_expr_pos = median(expr, na.rm = TRUE),
+    mean_expr_pos = mean(expr, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("\nExpression summary in KAMPR+ cells:\n")
+print(scatter_summary_df)
+
+write.csv(
+  scatter_summary_df,
+  "plots/CANCER_LetrozoleAlone_KAMPR_positiveCells_expression_summary_Day_Response.csv",
+  row.names = FALSE
+)
+
+p_scatter_kampr_expr <- ggplot(
+  scatter_pos_df,
+  aes(x = Response_x_unique, y = expr, color = Response_plot)
+) +
+  geom_jitter(
+    shape = 16,
+    size = 0.90,
+    width = 0.18,
+    height = 0,
+    alpha = 0.62
+  ) +
+  stat_summary(
+    data = scatter_pos_df,
+    aes(x = Response_x_unique, y = expr, group = Response_x_unique),
+    inherit.aes = FALSE,
+    fun = median,
+    fun.min = median,
+    fun.max = median,
+    geom = "crossbar",
+    width = 0.48,
+    linewidth = 0.45,
+    color = "black"
+  ) +
+  facet_wrap(~Day_plot, nrow = 1, scales = "free_x") +
+  scale_color_manual(values = condition_cols, drop = FALSE) +
+  scale_x_discrete(labels = x_labels_unique) +
+  labs(
+    x = NULL,
+    y = paste0(gene_label_plot, " expression\nin KAMPR+ cancer cells")
+  ) +
+  theme_feline_clean(base_size = 10) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      vjust = 1,
+      face = "bold"
+    ),
+    legend.position = "none",
+    plot.margin = margin(2, 6, 6, 6)
+  )
+
+# ------------------------------------------------------------
+# 13) Assemble final aligned figure
+# ------------------------------------------------------------
+
+p_final_aligned <- p_umap_response /
+  p_bar_kampr_pct /
+  p_scatter_kampr_expr +
+  plot_layout(
+    heights = c(1.25, 0.78, 1.00),
+    guides = "collect"
+  ) &
+  theme(
+    legend.position = "right"
+  )
+
+print(p_umap_response)
+print(p_bar_kampr_pct)
+print(p_scatter_kampr_expr)
+print(p_final_aligned)
+
+
+
+# ============================================================
+# ANALYSIS OF TCGA DATA using the AMOCATI workflow
+# TCGA data were processed according to the online tutorial using the AMOCATI R package: https://paul-regnier.fr/en_gb/tutoriel-amocati/
+# 3d plots and KM plot analysis were generated using TCGA data and AMOCATI output
+# This code allows visualization of these data
+# ============================================================
+
+# ============================================================
+# KAMPR / HLA / CTL analysis
+# 3D plots + pooled KM analysis
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(scatterplot3d)
+  library(survival)
+  library(survminer)
+  library(dplyr)
+  library(stringr)
+  library(ggplot2)
+  library(grid)
+  library(cowplot)
+})
+# ============================================================
+# Clean 3D plots with axis labels placed much farther away
+# BLCA, KIRC, LUSC
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(scatterplot3d)
+})
+
+# ------------------------------------------------------------
+# 1) Shared colors
+# ------------------------------------------------------------
+
+group_cols <- c(
+  "Low" = "#9FB7D5",
+  "Intermediate" = "#6E6E6E",
+  "High" = "#D8A2A2"
+)
+
+# ------------------------------------------------------------
+# 2) Add axis labels far from the axes
+# ------------------------------------------------------------
+add_far_axis_labels <- function(
+    s3d,
+    xr,
+    yr,
+    zr,
+    z0,
+    xlab = "HLA-C",
+    ylab = "HLA-A",
+    zlab = "CTL score",
+    cex_lab = 1.30
+) {
+  
+  usr <- par("usr")
+  dx <- diff(usr[1:2])
+  dy <- diff(usr[3:4])
+  
+  # X-axis label: move a bit lower
+  x_mid <- s3d$xyz.convert(
+    x = mean(xr),
+    y = yr[1],
+    z = z0
+  )
+  
+  text(
+    x = x_mid$x,
+    y = x_mid$y - 0.24 * dy,
+    labels = xlab,
+    cex = cex_lab,
+    font = 2
+  )
+  
+  # Y-axis label: move farther right and slightly lower
+  y_mid <- s3d$xyz.convert(
+    x = xr[2],
+    y = mean(yr),
+    z = z0
+  )
+  
+  text(
+    x = y_mid$x + 0.30 * dx,
+    y = y_mid$y - 0.03 * dy,
+    labels = ylab,
+    srt = 55,
+    cex = cex_lab,
+    font = 2
+  )
+  
+  # Z-axis label: keep as is
+  z_mid <- s3d$xyz.convert(
+    x = xr[1],
+    y = yr[1],
+    z = mean(zr)
+  )
+  
+  text(
+    x = z_mid$x - 0.20 * dx,
+    y = z_mid$y,
+    labels = zlab,
+    srt = 90,
+    cex = cex_lab,
+    font = 2
+  )
+}
+# ------------------------------------------------------------
+# 3) Main plotting function
+# ------------------------------------------------------------
+
+plot_3d_scores <- function(
+    csv_file,
+    main_title,
+    draw_high_on_top = FALSE,
+    legend_cex = 0.8,
+    point_cex = 0.6,
+    stem_lwd = 0.7,
+    angle_val = 55
+) {
+  
+  # Load data
+  df <- read.csv(csv_file, stringsAsFactors = FALSE)
+  
+  # Check required columns
+  required_cols <- c("x", "y", "z", "group")
+  missing_cols <- setdiff(required_cols, colnames(df))
+  
+  if (length(missing_cols) > 0) {
+    stop("Missing columns in ", csv_file, ": ", paste(missing_cols, collapse = ", "))
+  }
+  
+  # Set group order
+  df$group <- factor(df$group, levels = c("Low", "Intermediate", "High"))
+  
+  # Optional: draw High samples last
+  if (draw_high_on_top) {
+    df <- df[order(df$group), ]
+  }
+  
+  # Colors
+  point_cols <- group_cols[as.character(df$group)]
+  stem_cols  <- adjustcolor(point_cols, alpha.f = 0.35)
+  
+  # Axis ranges
+  xr <- range(df$x, na.rm = TRUE)
+  yr <- range(df$y, na.rm = TRUE)
+  zr <- range(df$z, na.rm = TRUE)
+  z0 <- zr[1]
+  
+  # Margins
+  par(mar = c(5, 5, 3, 9), xpd = NA)
+  
+  # Base 3D plot
+  s3d <- scatterplot3d(
+    x = df$x,
+    y = df$y,
+    z = df$z,
+    type = "n",
+    angle = angle_val,
+    scale.y = 1,
+    box = FALSE,
+    grid = FALSE,
+    xlab = "",
+    ylab = "",
+    zlab = "",
+    main = main_title,
+    cex.axis = 0.9
+  )
+  
+  # Draw stems
+  for (i in seq_len(nrow(df))) {
+    s3d$points3d(
+      x = c(df$x[i], df$x[i]),
+      y = c(df$y[i], df$y[i]),
+      z = c(z0, df$z[i]),
+      type = "l",
+      col = stem_cols[i],
+      lwd = stem_lwd
+    )
+  }
+  
+  # Draw points
+  s3d$points3d(
+    x = df$x,
+    y = df$y,
+    z = df$z,
+    col = point_cols,
+    pch = 16,
+    cex = point_cex
+  )
+  
+  # Add distant axis labels
+  add_far_axis_labels(
+    s3d = s3d,
+    xr = xr,
+    yr = yr,
+    zr = zr,
+    z0 = z0,
+    xlab = "HLA-C",
+    ylab = "HLA-A",
+    zlab = "CTL score",
+    cex_lab = 1.30
+  )
+  
+  # Add legend
+  usr <- par("usr")
+  
+  legend(
+    x = usr[2] + 0.04 * diff(usr[1:2]),
+    y = usr[4],
+    legend = c("Low", "Intermediate", "High"),
+    title = "KAMPR",
+    col = group_cols[c("Low", "Intermediate", "High")],
+    pch = 16,
+    pt.cex = 1.0,
+    bty = "n",
+    xjust = 0,
+    yjust = 1,
+    cex = legend_cex
+  )
+  
+  invisible(s3d)
+}
+
+# ------------------------------------------------------------
+# 4) BLCA
+# ------------------------------------------------------------
+
+plot_3d_scores(
+  csv_file = "TCGA-BLCA_3D_scores_2026-04-21.csv",
+  main_title = "BLCA",
+  draw_high_on_top = FALSE,
+  legend_cex = 0.8
+)
+
+# ------------------------------------------------------------
+# 5) KIRC
+# ------------------------------------------------------------
+
+plot_3d_scores(
+  csv_file = "TCGA-KIRC_3D_scores_2026-04-21.csv",
+  main_title = "KIRC",
+  draw_high_on_top = TRUE,
+  legend_cex = 0.8
+)
+
+# ------------------------------------------------------------
+# 6) LUSC
+# ------------------------------------------------------------
+
+plot_3d_scores(
+  csv_file = "TCGA-LUSC_3D_scores_2026-04-21.csv",
+  main_title = "LUSC",
+  draw_high_on_top = FALSE,
+  legend_cex = 0.8
+)
+# ============================================================
+# 4) Load KM data
+# ============================================================
+
+df <- read.csv("Pooled_multi_cancer_KM_2026-04-21.csv", stringsAsFactors = FALSE)
+
+# Clean group names
+df <- df %>%
+  mutate(
+    combo_plot = combo,
+    combo_plot = str_replace_all(combo_plot, "LINC00885", "KAMPR"),
+    combo_plot = str_replace_all(combo_plot, "QS_CTL", "CTL"),
+    combo_plot = factor(combo_plot, levels = group_levels)
+  ) %>%
+  filter(
+    !is.na(combo_plot),
+    !is.na(time),
+    !is.na(event)
+  )
+
+# ============================================================
+# 5) Patient numbers
+# ============================================================
+
+n_by_group <- df %>%
+  count(combo_plot, name = "n") %>%
+  mutate(
+    combo_plot = factor(as.character(combo_plot), levels = group_levels),
+    prop = n / sum(n)
+  ) %>%
+  arrange(combo_plot)
+
+n_total <- nrow(df)
+n_vec <- setNames(n_by_group$n, as.character(n_by_group$combo_plot))
+
+cat("\nNumber of patients per group:\n")
+print(n_by_group)
+
+cat("\nTotal n =", n_total, "\n\n")
+
+# ============================================================
+# 6) Targeted log-rank test
+# ============================================================
+
+target_group <- "HLA-A_Low | KAMPR_High | CTL_Low"
+
+df_test <- df %>%
+  mutate(
+    comparison_group = ifelse(combo_plot == target_group, "Target", "Other"),
+    comparison_group = factor(comparison_group, levels = c("Other", "Target"))
+  )
+
+logrank_res <- survdiff(Surv(time, event) ~ comparison_group, data = df_test)
+
+pval_target <- 1 - pchisq(
+  logrank_res$chisq,
+  df = length(logrank_res$n) - 1
+)
+
+pval_label <- paste0(
+  "p = ",
+  format.pval(pval_target, digits = 2, eps = 1e-4)
+)
+
+cat("\nLog-rank test: target group vs others\n")
+print(logrank_res)
+cat("p-value =", signif(pval_target, 4), "\n\n")
+
+# ============================================================
+# 7) Survival curve data
+# ============================================================
+
+fit <- survfit(Surv(time, event) ~ combo_plot, data = df)
+
+surv_df <- surv_summary(fit, data = df) %>%
+  mutate(
+    combo_clean = str_remove(strata, "^combo_plot="),
+    combo_clean = factor(combo_clean, levels = group_levels)
+  )
+
+# ============================================================
+# 8) Legend labels
+# ============================================================
+
+legend_expr <- c(
+  bquote("HLA-A"^Low  ~ "|" ~ "KAMPR"^Low  ~ "|" ~ "CTL"^Low  ~ "  n = " ~ .(n_vec["HLA-A_Low | KAMPR_Low | CTL_Low"])),
+  bquote("HLA-A"^Low  ~ "|" ~ "KAMPR"^High ~ "|" ~ "CTL"^Low  ~ "  n = " ~ .(n_vec["HLA-A_Low | KAMPR_High | CTL_Low"])),
+  bquote("HLA-A"^High ~ "|" ~ "KAMPR"^Low  ~ "|" ~ "CTL"^High ~ "  n = " ~ .(n_vec["HLA-A_High | KAMPR_Low | CTL_High"])),
+  bquote("HLA-A"^High ~ "|" ~ "KAMPR"^High ~ "|" ~ "CTL"^High ~ "  n = " ~ .(n_vec["HLA-A_High | KAMPR_High | CTL_High"]))
+)
+
+# ============================================================
+# 9) KM plot without legend
+# ============================================================
+
+xmax_time <- max(df$time, na.rm = TRUE)
+
+p_km <- ggplot(
+  surv_df,
+  aes(x = time, y = surv, color = combo_clean)
+) +
+  geom_step(linewidth = 0.9) +
+  annotate(
+    "text",
+    x = xmax_time * 0.06,
+    y = 0.56,
+    label = pval_label,
+    hjust = 0,
+    size = 3.2
+  ) +
+  scale_color_manual(
+    values = km_cols,
+    breaks = group_levels,
+    name = ""
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, xmax_time, by = 1000),
+    expand = expansion(mult = c(0.02, 0.04))
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = c(0, 0.25, 0.50, 0.75, 1.00),
+    expand = expansion(mult = c(0.02, 0.02))
+  ) +
+  labs(
+    x = "Time (days)",
+    y = "Overall survival probability"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10, color = "black"),
+    legend.position = "none",
+    panel.border = element_blank(),
+    plot.title = element_blank()
+  )
+
+print(p_km)
+
+# ============================================================
+# 10) Pie chart of group proportions
+# ============================================================
+
+p_pie <- ggplot(
+  n_by_group,
+  aes(x = "", y = prop, fill = combo_plot)
+) +
+  geom_col(width = 1, color = "white", linewidth = 0.7) +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = km_cols, drop = FALSE) +
+  theme_void() +
+  theme(
+    legend.position = "none",
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+print(p_pie)
+
+# ============================================================
+# 11) Legend-only plot
+# ============================================================
+
+p_for_legend <- ggplot(
+  n_by_group,
+  aes(x = combo_plot, y = n, color = combo_plot)
+) +
+  geom_point(size = 3) +
+  scale_color_manual(
+    values = km_cols,
+    breaks = group_levels,
+    labels = legend_expr,
+    name = ""
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.text = element_text(size = 9),
+    legend.key.size = unit(0.9, "lines"),
+    legend.spacing.y = unit(0.18, "lines")
+  ) +
+  guides(
+    color = guide_legend(
+      ncol = 1,
+      byrow = TRUE,
+      override.aes = list(size = 3.5)
+    )
+  )
+
+legend_grob <- cowplot::get_legend(p_for_legend)
+
+p_legend <- cowplot::ggdraw() +
+  cowplot::draw_label(
+    paste0("Total n = ", n_total),
+    x = 0.02,
+    y = 0.95,
+    hjust = 0,
+    fontface = "bold",
+    size = 11
+  ) +
+  cowplot::draw_grob(
+    legend_grob,
+    x = 0.00,
+    y = 0.05,
+    width = 1,
+    height = 0.85
+  )
+
+print(p_legend)
+
+# ============================================================
+# 12) Optional: combine KM + pie + legend
+# ============================================================
+
+p_combined <- cowplot::plot_grid(
+  p_km,
+  cowplot::plot_grid(
+    p_pie,
+    p_legend,
+    ncol = 1,
+    rel_heights = c(0.45, 0.55)
+  ),
+  ncol = 2,
+  rel_widths = c(0.65, 0.35)
+)
+
+print(p_combined)
+
+
+
+
+
