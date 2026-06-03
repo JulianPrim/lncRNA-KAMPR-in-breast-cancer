@@ -1,0 +1,608 @@
+# ------------------------------------------------------------
+# Analysis of Wu et al.scRNAseq atlas of breast tumors
+# 29/05/2026
+# Julian Primig
+# ------------------------------------------------------------
+
+# This code generates the fig3A and fig3D:
+# Based on KAMPR / LINC00885 analysis in ER+ Cancer Epithelial Cells differential expression analysis
+# Generation of violin plots for immune genes and HLA genes
+
+
+# ============================================================
+# Violin plot: selected genes in ER+ Cancer Epithelial cells
+# KAMPR/LINC00885+ vs KAMPR/LINC00885-
+# Layout: 2 columns x 4 rows
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(tibble)
+  library(grid)
+})
+
+# ------------------------------------------------------------
+# 0) Parameters
+# ------------------------------------------------------------
+
+seurat_file <- "seurat_obj.rds"
+
+gene_lnc   <- "LINC00885"
+gene_label <- "KAMPR"
+
+genes_migration <- c(
+  "LY6E",
+  "CCL28",
+  "CD24",
+  "LGALS3",
+  "TNFRSF12A",
+  "CXCL17",
+  "SIGLEC15",
+  "SERPINA1"
+)
+
+cols_kampr <- c(
+  "KAMPR-" = "#A77EAA",
+  "KAMPR+" = "#7FA06A"
+)
+
+outdir <- "KAMPR_migration_violin_plots"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+# ------------------------------------------------------------
+# 1) Load Seurat object
+# ------------------------------------------------------------
+
+seurat_obj <- readRDS(seurat_file)
+
+if (!inherits(seurat_obj, "Seurat")) {
+  stop("The loaded object is not a Seurat object.")
+}
+
+DefaultAssay(seurat_obj) <- "RNA"
+
+message("Loaded object: ", seurat_file)
+message("Cells: ", ncol(seurat_obj))
+message("Features: ", nrow(seurat_obj))
+
+# ------------------------------------------------------------
+# 2) Check metadata and genes
+# ------------------------------------------------------------
+
+stopifnot(all(c("subtype", "celltype_major") %in% colnames(seurat_obj@meta.data)))
+
+if (!(gene_lnc %in% rownames(seurat_obj))) {
+  stop(
+    gene_lnc, " not found in object. Try:\n",
+    "grep('LINC00885|KAMPR|00885', rownames(seurat_obj), value = TRUE)"
+  )
+}
+
+genes_present <- genes_migration[genes_migration %in% rownames(seurat_obj)]
+genes_missing <- setdiff(genes_migration, genes_present)
+
+if (length(genes_missing) > 0) {
+  warning("Missing genes skipped: ", paste(genes_missing, collapse = ", "))
+}
+
+if (length(genes_present) == 0) {
+  stop("None of the requested genes were found in the object.")
+}
+
+gene_order <- genes_migration[genes_migration %in% genes_present]
+
+message("Genes used: ", paste(gene_order, collapse = ", "))
+
+# ------------------------------------------------------------
+# 3) Subset ER+ Cancer Epithelial cells
+# ------------------------------------------------------------
+
+er_epi_obj <- subset(
+  seurat_obj,
+  subset = subtype == "ER+" & celltype_major == "Cancer Epithelial"
+)
+
+DefaultAssay(er_epi_obj) <- "RNA"
+
+message("ER+ Cancer Epithelial cells: ", ncol(er_epi_obj))
+
+if (ncol(er_epi_obj) == 0) {
+  stop("No ER+ Cancer Epithelial cells found with subtype == 'ER+' & celltype_major == 'Cancer Epithelial'.")
+}
+
+# Optional normalization for coherence
+er_epi_obj <- NormalizeData(er_epi_obj, verbose = FALSE)
+
+# ------------------------------------------------------------
+# 4) Define KAMPR+ and KAMPR- cells
+# ------------------------------------------------------------
+
+lnc_expr <- FetchData(er_epi_obj, vars = gene_lnc)[, 1]
+
+er_epi_obj$KAMPR_status <- ifelse(
+  lnc_expr > 0,
+  "KAMPR+",
+  "KAMPR-"
+)
+
+er_epi_obj$KAMPR_status <- factor(
+  er_epi_obj$KAMPR_status,
+  levels = c("KAMPR-", "KAMPR+")
+)
+
+message("KAMPR groups:")
+print(table(er_epi_obj$KAMPR_status))
+
+# ------------------------------------------------------------
+# 5) Fetch expression data
+# ------------------------------------------------------------
+
+plot_df <- FetchData(
+  object = er_epi_obj,
+  vars = c(gene_order, "KAMPR_status")
+) %>%
+  rownames_to_column("Cell") %>%
+  pivot_longer(
+    cols = all_of(gene_order),
+    names_to = "Gene",
+    values_to = "Expression"
+  ) %>%
+  mutate(
+    Gene = factor(Gene, levels = gene_order),
+    KAMPR_status = factor(KAMPR_status, levels = c("KAMPR-", "KAMPR+"))
+  )
+
+# ------------------------------------------------------------
+# 6) Stats per gene
+# ------------------------------------------------------------
+
+stat_df <- plot_df %>%
+  group_by(Gene) %>%
+  summarise(
+    p_value = tryCatch(
+      wilcox.test(Expression ~ KAMPR_status)$p.value,
+      error = function(e) NA_real_
+    ),
+    y.position = max(Expression, na.rm = TRUE) * 1.10 + 0.05,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Gene = factor(Gene, levels = gene_order),
+    p_adj = p.adjust(p_value, method = "BH"),
+    stars = case_when(
+      is.na(p_adj)   ~ "ns",
+      p_adj < 1e-4   ~ "****",
+      p_adj < 1e-3   ~ "***",
+      p_adj < 1e-2   ~ "**",
+      p_adj < 0.05   ~ "*",
+      TRUE           ~ "ns"
+    )
+  )
+
+stat_df_sig <- stat_df %>%
+  filter(stars != "ns") %>%
+  mutate(
+    Gene    = factor(Gene, levels = gene_order),
+    x_start = 1.28,
+    x_end   = 1.72,
+    x_text  = 1.50,
+    y_line  = y.position * 0.965
+  )
+
+
+# ------------------------------------------------------------
+# 8) Violin plot
+# Layout: 2 columns x 4 rows
+# ------------------------------------------------------------
+
+p_migration_violin <- ggplot(
+  plot_df,
+  aes(x = KAMPR_status, y = Expression, fill = KAMPR_status)
+) +
+  geom_violin(
+    width = 0.82,
+    scale = "width",
+    trim = TRUE,
+    color = "#2F2F2F",
+    linewidth = 0.55,
+    alpha = 0.95
+  ) +
+  stat_summary(
+    fun = median,
+    fun.min = median,
+    fun.max = median,
+    geom = "errorbar",
+    width = 0.16,
+    linewidth = 0.75,
+    color = "#111111"
+  ) +
+  geom_segment(
+    data = stat_df_sig,
+    aes(
+      x = x_start,
+      xend = x_end,
+      y = y_line,
+      yend = y_line
+    ),
+    inherit.aes = FALSE,
+    linewidth = 0.55,
+    color = "#111111",
+    lineend = "round"
+  ) +
+  geom_text(
+    data = stat_df_sig,
+    aes(
+      x = x_text,
+      y = y.position,
+      label = stars
+    ),
+    inherit.aes = FALSE,
+    size = 3.4,
+    fontface = "bold",
+    color = "#111111"
+  ) +
+  facet_wrap(
+    ~ Gene,
+    ncol = 2,
+    nrow = 4,
+    scales = "free_y"
+  ) +
+  scale_fill_manual(
+    values = cols_kampr,
+    guide = "none"
+  ) +
+  labs(
+    x = NULL,
+    y = "norm logUMI/cell",
+    title = NULL
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      vjust = 1,
+      size = 8.5,
+      color = "black"
+    ),
+    axis.text.y = element_text(
+      size = 8,
+      color = "black"
+    ),
+    axis.title.y = element_text(
+      size = 10.5,
+      color = "black"
+    ),
+    strip.background = element_blank(),
+    strip.text = element_text(
+      size = 10.5,
+      face = "italic",
+      color = "black"
+    ),
+    legend.position = "none",
+    panel.spacing.x = unit(0.75, "lines"),
+    panel.spacing.y = unit(0.85, "lines"),
+    plot.margin = margin(10, 15, 10, 10)
+  )
+
+p_migration_violin
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+######################################################################
+
+# ============================================================
+# Violin plot: HLA genes in ER+ Cancer Epithelial cells
+# KAMPR/LINC00885+ vs KAMPR/LINC00885-
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(tibble)
+  library(stringr)
+  library(ggpubr)
+})
+
+# ------------------------------------------------------------
+# 0) Parameters
+# ------------------------------------------------------------
+
+seurat_file <- "seurat_obj.rds"
+
+gene_lnc <- "LINC00885"
+gene_label <- "KAMPR"
+
+genes_hla <- c(
+  "B2M",
+  "HLA-A",
+  "HLA-B",
+  "HLA-C",
+  "HLA-DRA",
+  "HLA-DRB1"
+)
+
+cols_kampr <- c(
+  "KAMPR-" = "#D95F43",
+  "KAMPR+" = "#4FA694"
+)
+
+
+
+outdir <- "KAMPR_HLA_violin_plots"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+# ------------------------------------------------------------
+# 1) Load Seurat object
+# ------------------------------------------------------------
+
+seurat_obj <- readRDS(seurat_file)
+
+if (!inherits(seurat_obj, "Seurat")) {
+  stop("The loaded object is not a Seurat object.")
+}
+
+DefaultAssay(seurat_obj) <- "RNA"
+
+message("Loaded object: ", seurat_file)
+message("Cells: ", ncol(seurat_obj))
+message("Features: ", nrow(seurat_obj))
+
+# ------------------------------------------------------------
+# 2) Check metadata and genes
+# ------------------------------------------------------------
+
+stopifnot(all(c("subtype", "celltype_major") %in% colnames(seurat_obj@meta.data)))
+
+if (!(gene_lnc %in% rownames(seurat_obj))) {
+  stop(
+    gene_lnc, " not found in object. Try:\n",
+    "grep('LINC00885|KAMPR|00885', rownames(seurat_obj), value = TRUE)"
+  )
+}
+
+genes_hla_present <- genes_hla[genes_hla %in% rownames(seurat_obj)]
+genes_hla_missing <- setdiff(genes_hla, genes_hla_present)
+
+if (length(genes_hla_missing) > 0) {
+  warning(
+    "Missing genes skipped: ",
+    paste(genes_hla_missing, collapse = ", ")
+  )
+}
+
+if (length(genes_hla_present) == 0) {
+  stop("None of the requested HLA genes were found in the object.")
+}
+
+message("HLA genes used: ", paste(genes_hla_present, collapse = ", "))
+
+# ------------------------------------------------------------
+# 3) Subset ER+ Cancer Epithelial cells
+# Same logic as your DE analysis
+# ------------------------------------------------------------
+
+er_epi_obj <- subset(
+  seurat_obj,
+  subset = subtype == "ER+" & celltype_major == "Cancer Epithelial"
+)
+
+DefaultAssay(er_epi_obj) <- "RNA"
+
+message("ER+ Cancer Epithelial cells: ", ncol(er_epi_obj))
+
+if (ncol(er_epi_obj) == 0) {
+  stop("No ER+ Cancer Epithelial cells found with subtype == 'ER+' & celltype_major == 'Cancer Epithelial'.")
+}
+
+# Optional but coherent with your DE pipeline
+er_epi_obj <- NormalizeData(er_epi_obj, verbose = FALSE)
+
+# ------------------------------------------------------------
+# 4) Define KAMPR+ and KAMPR- cells
+# ------------------------------------------------------------
+
+lnc_expr <- FetchData(er_epi_obj, vars = gene_lnc)[, 1]
+
+er_epi_obj$KAMPR_status <- ifelse(
+  lnc_expr > 0,
+  "KAMPR+",
+  "KAMPR-"
+)
+
+er_epi_obj$KAMPR_status <- factor(
+  er_epi_obj$KAMPR_status,
+  levels = c("KAMPR+", "KAMPR-")
+)
+
+message("KAMPR groups:")
+print(table(er_epi_obj$KAMPR_status))
+
+# ------------------------------------------------------------
+# 5) Fetch expression data
+# ------------------------------------------------------------
+
+plot_df <- FetchData(
+  object = er_epi_obj,
+  vars = c(gene_lnc, genes_hla_present, "KAMPR_status")
+) %>%
+  rownames_to_column("Cell") %>%
+  pivot_longer(
+    cols = all_of(genes_hla_present),
+    names_to = "Gene",
+    values_to = "Expression"
+  ) %>%
+  mutate(
+    Gene = factor(Gene, levels = genes_hla[genes_hla %in% genes_hla_present]),
+    KAMPR_status = factor(KAMPR_status, levels = c("KAMPR+", "KAMPR-"))
+  )
+
+# ------------------------------------------------------------
+# 6) Stats for stars
+# ------------------------------------------------------------
+
+stat_df <- plot_df %>%
+  group_by(Gene) %>%
+  summarise(
+    p_value = wilcox.test(Expression ~ KAMPR_status)$p.value,
+    y.position = max(Expression, na.rm = TRUE) * 1.12 + 0.05,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_adj = p.adjust(p_value, method = "BH"),
+    stars = case_when(
+      p_adj < 0.0001 ~ "****",
+      p_adj < 0.001  ~ "***",
+      p_adj < 0.01   ~ "**",
+      p_adj < 0.05   ~ "*",
+      TRUE ~ "ns"
+    ),
+    group1 = "KAMPR-",
+    group2 = "KAMPR+"
+  )
+
+stat_df_plot <- stat_df %>%
+  filter(stars != "ns") %>%
+  mutate(
+    x_text  = 1.5,
+    x_start = 1.28,
+    x_end   = 1.72,
+    y_text  = y.position,
+    y_line  = y.position * 0.965
+  )
+
+# ------------------------------------------------------------
+# 8) Violin plot, compact style
+# ------------------------------------------------------------
+p_hla_violin <- ggplot(
+  plot_df,
+  aes(x = KAMPR_status, y = Expression, fill = KAMPR_status)
+) +
+  geom_violin(
+    width = 0.82,
+    scale = "width",
+    trim = TRUE,
+    color = "#2F2F2F",
+    linewidth = 0.60,
+    alpha = 0.95
+  ) +
+  
+  # médiane = petit trait horizontal noir épais
+  stat_summary(
+    fun = median,
+    fun.min = median,
+    fun.max = median,
+    geom = "errorbar",
+    width = 0.16,
+    linewidth = 0.8,
+    color = "#111111"
+  ) +
+  
+  # trait noir sous les étoiles
+  geom_segment(
+    data = stat_df_plot,
+    aes(
+      x = x_start,
+      xend = x_end,
+      y = y_line,
+      yend = y_line
+    ),
+    inherit.aes = FALSE,
+    linewidth = 0.6,
+    color = "#111111",
+    lineend = "round"
+  ) +
+  
+  # étoiles
+  geom_text(
+    data = stat_df_plot,
+    aes(
+      x = x_text,
+      y = y_text,
+      label = stars
+    ),
+    inherit.aes = FALSE,
+    size = 3.4,
+    color = "#111111",
+    fontface = "bold"
+  ) +
+  
+  facet_wrap(
+    ~ Gene,
+    ncol = 1,
+    scales = "free_y",
+    strip.position = "right"
+  ) +
+  
+  scale_fill_manual(
+    values = cols_kampr,
+    guide = "none"
+  ) +
+  
+  labs(
+    x = NULL,
+    y = "norm logUMI/cell",
+    title = NULL
+  ) +
+  
+  coord_cartesian(clip = "off") +
+  
+  theme_classic(base_size = 11) +
+  theme(
+    axis.title.y = element_text(
+      size = 10.5,
+      color = "black"
+    ),
+    axis.text.x = element_text(
+      size = 9,
+      color = "black",
+      angle = 45,
+      hjust = 1,
+      vjust = 1
+    ),
+    axis.text.y = element_text(
+      size = 8.5,
+      color = "black"
+    ),
+    strip.background = element_blank(),
+    strip.text = element_text(
+      size = 10.5,
+      face = "italic",
+      color = "black"
+    ),
+    strip.text.y.right = element_text(
+      angle = 0,
+      size = 10.5,
+      face = "italic",
+      color = "black"
+    ),
+    legend.position = "none",
+    panel.spacing.y = unit(0.25, "lines"),
+    plot.margin = margin(10, 35, 10, 10)
+  )
+
+p_hla_violin
+
+######################################################################
